@@ -1,4 +1,4 @@
-.PHONY: review fmt-check lint test audit deny coverage mutants review-quick
+.PHONY: review fmt-check lint test audit deny coverage mutants review-quick update-golden
 
 # Full review — run before pushing or merging
 review: fmt-check lint test audit deny
@@ -58,3 +58,13 @@ mutants:
 	else \
 		echo "cargo-mutants not installed. Run: cargo install cargo-mutants"; \
 	fi
+
+# Regenerate the committed golden snapshot files. Inspect the diff manually
+# before committing — this target is intentional, not part of `make review`.
+update-golden:
+	@echo "Regenerating tests/golden/medium_app.{toon,txt}..."
+	@TY_AVAILABLE=1 cargo run --quiet --bin tyreach -- \
+		snapshot tests/fixtures/medium_app \
+		--budget 5000 \
+		--out tests/golden/medium_app
+	@echo "Done. Review the diff before committing."

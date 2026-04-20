@@ -25,13 +25,28 @@ use crate::qname::qname_for;
 
 const GOTO_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// One BFS snapshot — flat nodes + edges plus per-qname depth for Phase 3
-/// ranking.
+/// Per-snapshot truncation metadata emitted by `budget::fit_to_budget`.
+///
+/// When `Some`, the snapshot was shrunk to fit a token budget and the renderer
+/// skips optional signature/doc lines.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct Truncation {
+    pub dropped_nodes: u32,
+    pub original_node_count: u32,
+}
+
+/// One BFS snapshot — flat nodes + edges plus per-qname depth for ranking,
+/// optional per-qname scores (populated by `rank::rank`), and optional
+/// truncation metadata (populated by `budget::fit_to_budget`).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Snapshot {
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
     pub depth_by_qname: HashMap<String, u32>,
+    #[serde(default)]
+    pub scores: HashMap<String, f64>,
+    #[serde(default)]
+    pub truncation: Option<Truncation>,
 }
 
 /// Pending item in the BFS queue: an internal function we need to expand.

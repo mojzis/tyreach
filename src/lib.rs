@@ -8,6 +8,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
+pub mod budget;
 pub mod classify;
 pub mod entry;
 pub mod extract;
@@ -15,6 +16,8 @@ pub mod lsp;
 pub mod model;
 pub mod parse;
 pub mod qname;
+pub mod rank;
+pub mod render;
 pub mod toon_io;
 pub mod walker;
 pub mod workspace;

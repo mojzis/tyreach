@@ -1,0 +1,11 @@
+medium_app.main.main  (entry)
+    def main() -> str
+  -> medium_app.a.run_a, medium_app.b.run_b
+medium_app.a.run_a
+    def run_a() -> str
+  -> json.dumps [ext], medium_app.shared.util
+medium_app.b.run_b
+    def run_b() -> str
+  -> medium_app.shared.util
+medium_app.shared.util
+    def util(arg: str) -> str

@@ -1,0 +1,16 @@
+# tyreach snapshot v1
+# nodes
+nodes[5]{qname,signature,doc,file,line,kind}:
+  medium_app.main.main,"def main() -> str","",medium_app/main.py,5,internal
+  medium_app.a.run_a,"def run_a() -> str","",medium_app/a.py,6,internal
+  json.dumps,"","","",0,external
+  medium_app.b.run_b,"def run_b() -> str","",medium_app/b.py,4,internal
+  medium_app.shared.util,"def util(arg: str) -> str","",medium_app/shared.py,1,internal
+
+# edges
+edges[5]{from,to,annotation}:
+  medium_app.main.main,medium_app.a.run_a,resolved
+  medium_app.main.main,medium_app.b.run_b,resolved
+  medium_app.a.run_a,json.dumps,external
+  medium_app.a.run_a,medium_app.shared.util,resolved
+  medium_app.b.run_b,medium_app.shared.util,resolved
