@@ -23,6 +23,10 @@ pub struct CallSite {
     pub character: u32,
     /// Byte range of the callee-name token in the source.
     pub byte_range: Range<usize>,
+    /// `true` when the callee is itself a call expression (`foo()()`) or
+    /// another dynamic construct we cannot resolve via goto-definition. The
+    /// walker emits these as `<unresolved>` without calling the LSP.
+    pub dynamic: bool,
 }
 
 /// Extract call sites inside a function body.
@@ -44,16 +48,46 @@ pub fn extract_call_sites(parsed: &ParsedFile, within: Range<usize>) -> Vec<Call
     let mut cursor = tree_sitter::QueryCursor::new();
     let callee_idx =
         query.capture_index_for_name("callee_name").expect("query must have @callee_name capture");
+    let call_idx = query.capture_index_for_name("call").expect("query must have @call capture");
+    let dynamic_idx = query.capture_index_for_name("dynamic_call");
 
     let mut seen_starts = std::collections::HashSet::new();
     let mut sites = Vec::new();
 
     let mut matches = cursor.matches(query, scope, parsed.source.as_slice());
     while let Some(m) = matches.next() {
+        // Dynamic-call branch: `(call function: (call))` — the callee is
+        // another call expression, so goto-definition on it is meaningless.
+        if let Some(d_idx) = dynamic_idx {
+            if let Some(dyn_node) = m.captures.iter().find(|c| c.index == d_idx).map(|c| c.node) {
+                let start_byte = dyn_node.start_byte();
+                if !seen_starts.insert(start_byte) {
+                    continue;
+                }
+                let text =
+                    dyn_node.utf8_text(&parsed.source).unwrap_or("<invalid-utf8>").to_owned();
+                let position = dyn_node.start_position();
+                sites.push(CallSite {
+                    callee_text: text,
+                    line: u32::try_from(position.row).unwrap_or(u32::MAX),
+                    character: u32::try_from(position.column).unwrap_or(u32::MAX),
+                    byte_range: dyn_node.byte_range(),
+                    dynamic: true,
+                });
+                continue;
+            }
+        }
+
         let Some(callee_node) = m.captures.iter().find(|c| c.index == callee_idx).map(|c| c.node)
         else {
             continue;
         };
+
+        // Skip matches where the outer call was emitted but we don't have a
+        // usable callee (shouldn't happen with this query, but belt-and-suspenders).
+        if m.captures.iter().all(|c| c.index != call_idx) {
+            continue;
+        }
 
         let start_byte = callee_node.start_byte();
         if !seen_starts.insert(start_byte) {
@@ -67,6 +101,7 @@ pub fn extract_call_sites(parsed: &ParsedFile, within: Range<usize>) -> Vec<Call
             line: u32::try_from(position.row).unwrap_or(u32::MAX),
             character: u32::try_from(position.column).unwrap_or(u32::MAX),
             byte_range: callee_node.byte_range(),
+            dynamic: false,
         });
     }
 
@@ -86,6 +121,8 @@ fn call_site_query(tree: &tree_sitter::Tree) -> &'static tree_sitter::Query {
               (identifier) @callee_name
               (attribute attribute: (identifier) @callee_name)
             ]) @call
+
+            (call function: (call)) @dynamic_call
             ",
         )
         .expect("call site extraction query must compile")
