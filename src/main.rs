@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use tyreach::budget::fit_to_budget;
-use tyreach::entry::{detect_entries, parse_cli_entry, EntryPoint};
+use tyreach::entry::resolve_entries;
 use tyreach::rank::rank;
 use tyreach::render::render;
 use tyreach::toon_io::{read_snapshot_toon, write_snapshot_toon};
@@ -114,20 +114,6 @@ async fn run_snapshot(
     }
 
     Ok(())
-}
-
-fn resolve_entries(root: &Path, cli_entries: &[String]) -> Result<Vec<EntryPoint>> {
-    if cli_entries.is_empty() {
-        let detected = detect_entries(root).context("detect entries from pyproject.toml")?;
-        if detected.is_empty() {
-            anyhow::bail!(
-                "no entry points found; supply --entry path/to/file.py::func or add [project.scripts]"
-            );
-        }
-        Ok(detected)
-    } else {
-        cli_entries.iter().map(|spec| parse_cli_entry(spec, root)).collect()
-    }
 }
 
 fn derive_prefix_from_name(name: String) -> PathBuf {

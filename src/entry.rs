@@ -1,17 +1,25 @@
 //! Entry-point discovery.
 //!
-//! Two sources:
+//! Three sources, in precedence order (highest first):
 //!
-//! 1. `pyproject.toml` `[project.scripts]` — auto-detected via
+//! 1. `--entry` CLI flag — parsed via [`parse_cli_entry`]. Accepts
+//!    `path/to/file.py::func`. The `::func` suffix is mandatory for v1. Paths
+//!    are resolved relative to the repo root argument, **not** the process
+//!    CWD.
+//! 2. `tyreach.toml` — parsed via [`parse_tyreach_toml`]. Top-level
+//!    `entries = [{ name, entry_file, function = "main" (optional) }]`. Paths
+//!    are resolved relative to the repo root.
+//! 3. `pyproject.toml` `[project.scripts]` — auto-detected via
 //!    [`detect_entries`]. Script specs look like `"name" = "module.path:func"`.
 //!    We resolve the module portion to a `.py` file on disk by trying, in
 //!    order: `{root}/{path}.py`, `{root}/src/{path}.py`,
 //!    `{root}/{path}/__init__.py`, `{root}/src/{path}/__init__.py`.
-//! 2. `--entry` CLI flag — parsed via [`parse_cli_entry`]. Accepts
-//!    `path/to/file.py::func`. The `::func` suffix is mandatory for v1.
 //!
-//! `tyreach.toml` and Dockerfile entry-point parsing are deferred to later
-//! phases; the skeleton would slot in here.
+//! The [`resolve_entries`] helper implements the precedence: CLI wins if
+//! non-empty; else `tyreach.toml` wins if present; else auto-detect
+//! `pyproject.toml`.
+//!
+//! Dockerfile entry-point parsing is deferred to v1.1.
 
 use std::path::{Path, PathBuf};
 
@@ -115,6 +123,118 @@ pub fn parse_cli_entry(spec: &str, repo_root: &Path) -> Result<EntryPoint> {
     }
 
     Ok(EntryPoint { name: spec.to_owned(), file: resolved, function: function.to_owned() })
+}
+
+/// Parse `{repo_root}/tyreach.toml` into a list of entry points.
+///
+/// Schema:
+///
+/// ```toml
+/// [[entries]]
+/// name = "cli"
+/// entry_file = "myapp/cli.py"
+/// function = "main"   # optional; defaults to "main"
+/// ```
+///
+/// Missing file → `Ok(Vec::new())`. Malformed TOML or an unreadable/missing
+/// `entry_file` on disk → `Err` with a span-aware message.
+pub fn parse_tyreach_toml(repo_root: &Path) -> Result<Vec<EntryPoint>> {
+    let path = repo_root.join("tyreach.toml");
+    if !path.is_file() {
+        return Ok(Vec::new());
+    }
+
+    let raw = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+
+    let doc: TyreachToml = toml::from_str(&raw).map_err(|err| {
+        // toml::de::Error carries a span. Surface it in the error message so
+        // users see the offending line/column alongside the reason.
+        let span = err.span();
+        match span {
+            Some(range) => {
+                let (line, col) = line_col(&raw, range.start);
+                anyhow!(
+                    "malformed tyreach.toml at {}:{}:{}: {}",
+                    path.display(),
+                    line,
+                    col,
+                    err.message()
+                )
+            }
+            None => anyhow!("malformed tyreach.toml {}: {}", path.display(), err.message()),
+        }
+    })?;
+
+    let mut out = Vec::new();
+    for raw_entry in doc.entries.unwrap_or_default() {
+        let entry_file = Path::new(&raw_entry.entry_file);
+        let resolved = if entry_file.is_absolute() {
+            entry_file.to_path_buf()
+        } else {
+            repo_root.join(entry_file)
+        };
+        if !resolved.is_file() {
+            anyhow::bail!(
+                "tyreach.toml entry {:?}: entry_file does not exist: {}",
+                raw_entry.name,
+                resolved.display()
+            );
+        }
+        let function = raw_entry.function.unwrap_or_else(|| "main".to_owned());
+        out.push(EntryPoint { name: raw_entry.name, file: resolved, function });
+    }
+    Ok(out)
+}
+
+/// Resolve entry points given the repo root and optional CLI entries.
+///
+/// Precedence (first non-empty source wins):
+///
+/// 1. `cli_entries` (parsed with [`parse_cli_entry`]).
+/// 2. `tyreach.toml` (parsed with [`parse_tyreach_toml`]).
+/// 3. `pyproject.toml` `[project.scripts]` (parsed with [`detect_entries`]).
+///
+/// Errors if *all three* sources yield zero entries — callers usually want to
+/// tell the user to supply `--entry` or populate one of the config files.
+pub fn resolve_entries(repo_root: &Path, cli_entries: &[String]) -> Result<Vec<EntryPoint>> {
+    if !cli_entries.is_empty() {
+        return cli_entries.iter().map(|spec| parse_cli_entry(spec, repo_root)).collect();
+    }
+
+    let from_tyreach = parse_tyreach_toml(repo_root).context("parse tyreach.toml")?;
+    if !from_tyreach.is_empty() {
+        return Ok(from_tyreach);
+    }
+
+    let detected = detect_entries(repo_root).context("detect entries from pyproject.toml")?;
+    if detected.is_empty() {
+        anyhow::bail!(
+            "no entry points found; supply --entry path/to/file.py::func, create tyreach.toml, or add [project.scripts]"
+        );
+    }
+    Ok(detected)
+}
+
+#[derive(Debug, Deserialize)]
+struct TyreachToml {
+    entries: Option<Vec<TyreachEntry>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TyreachEntry {
+    name: String,
+    entry_file: String,
+    function: Option<String>,
+}
+
+/// 1-based (line, column) from a byte offset into `src`.
+fn line_col(src: &str, byte: usize) -> (usize, usize) {
+    let clamped = byte.min(src.len());
+    let prefix = &src[..clamped];
+    let line = prefix.bytes().filter(|b| *b == b'\n').count() + 1;
+    let last_newline = prefix.rfind('\n').map_or(0, |p| p + 1);
+    let col = src[last_newline..clamped].chars().count() + 1;
+    (line, col)
 }
 
 #[cfg(test)]
@@ -250,5 +370,140 @@ demo = "nonexistent.module:run"
         .expect("write");
         let entries = detect_entries(dir.path()).expect("detect");
         assert!(entries.is_empty(), "unresolvable script spec must be skipped silently");
+    }
+
+    #[test]
+    fn tyreach_toml_missing_is_empty_not_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let entries = parse_tyreach_toml(dir.path()).expect("parse");
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn tyreach_toml_parses_entries_with_default_function() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pkg = dir.path().join("myapp");
+        std::fs::create_dir_all(&pkg).expect("mkdir");
+        std::fs::write(pkg.join("cli.py"), "def main():\n    pass\n").expect("cli.py");
+        std::fs::write(pkg.join("worker.py"), "def go():\n    pass\n").expect("worker.py");
+
+        std::fs::write(
+            dir.path().join("tyreach.toml"),
+            r#"
+[[entries]]
+name = "cli"
+entry_file = "myapp/cli.py"
+
+[[entries]]
+name = "worker"
+entry_file = "myapp/worker.py"
+function = "go"
+"#,
+        )
+        .expect("write tyreach.toml");
+
+        let entries = parse_tyreach_toml(dir.path()).expect("parse");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, "cli");
+        assert_eq!(entries[0].function, "main", "default function is `main`");
+        assert_eq!(entries[1].name, "worker");
+        assert_eq!(entries[1].function, "go");
+    }
+
+    #[test]
+    fn tyreach_toml_malformed_reports_location() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Unterminated table header — toml parser will reject at a known span.
+        std::fs::write(dir.path().join("tyreach.toml"), "[[entries\nname = \"x\"\n")
+            .expect("write");
+        let err = parse_tyreach_toml(dir.path()).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("malformed tyreach.toml"), "missing prefix: {msg}");
+        assert!(msg.contains(":1:"), "malformed toml must report line 1: {msg}");
+    }
+
+    #[test]
+    fn tyreach_toml_missing_entry_file_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("tyreach.toml"),
+            "[[entries]]\nname = \"x\"\nentry_file = \"nope.py\"\n",
+        )
+        .expect("write");
+        let err = parse_tyreach_toml(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("does not exist"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_entries_cli_beats_config_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pkg = dir.path().join("app");
+        std::fs::create_dir_all(&pkg).expect("mkdir");
+        std::fs::write(pkg.join("cli.py"), "def main():\n    pass\n").expect("cli");
+        std::fs::write(pkg.join("other.py"), "def run():\n    pass\n").expect("other");
+        std::fs::write(
+            dir.path().join("pyproject.toml"),
+            "[project]\nname=\"x\"\nversion=\"0.1.0\"\n[project.scripts]\nx = \"app.cli:main\"\n",
+        )
+        .expect("pyproject");
+        std::fs::write(
+            dir.path().join("tyreach.toml"),
+            "[[entries]]\nname=\"cli\"\nentry_file=\"app/cli.py\"\n",
+        )
+        .expect("tyreach");
+
+        let entries = resolve_entries(dir.path(), &["app/other.py::run".to_owned()]).expect("ok");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].function, "run", "cli must override config files");
+    }
+
+    #[test]
+    fn resolve_entries_tyreach_beats_pyproject() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pkg = dir.path().join("app");
+        std::fs::create_dir_all(&pkg).expect("mkdir");
+        std::fs::write(pkg.join("__init__.py"), "").expect("init");
+        std::fs::write(pkg.join("cli.py"), "def main():\n    pass\n").expect("cli");
+        std::fs::write(pkg.join("special.py"), "def run():\n    pass\n").expect("special");
+        std::fs::write(
+            dir.path().join("pyproject.toml"),
+            "[project]\nname=\"x\"\nversion=\"0.1.0\"\n[project.scripts]\nx = \"app.cli:main\"\n",
+        )
+        .expect("pyproject");
+        std::fs::write(
+            dir.path().join("tyreach.toml"),
+            "[[entries]]\nname=\"special\"\nentry_file=\"app/special.py\"\nfunction=\"run\"\n",
+        )
+        .expect("tyreach");
+
+        let entries = resolve_entries(dir.path(), &[]).expect("ok");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "special");
+        assert_eq!(entries[0].function, "run");
+    }
+
+    #[test]
+    fn resolve_entries_falls_back_to_pyproject() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pkg = dir.path().join("app");
+        std::fs::create_dir_all(&pkg).expect("mkdir");
+        std::fs::write(pkg.join("__init__.py"), "").expect("init");
+        std::fs::write(pkg.join("cli.py"), "def main():\n    pass\n").expect("cli");
+        std::fs::write(
+            dir.path().join("pyproject.toml"),
+            "[project]\nname=\"x\"\nversion=\"0.1.0\"\n[project.scripts]\nx = \"app.cli:main\"\n",
+        )
+        .expect("pyproject");
+
+        let entries = resolve_entries(dir.path(), &[]).expect("ok");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].function, "main");
+    }
+
+    #[test]
+    fn resolve_entries_errors_when_nothing_configured() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = resolve_entries(dir.path(), &[]).unwrap_err();
+        assert!(err.to_string().contains("no entry points"), "unexpected: {err}");
     }
 }
