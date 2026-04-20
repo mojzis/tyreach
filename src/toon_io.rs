@@ -138,27 +138,19 @@ pub fn read_snapshot_toon(src: &str) -> Result<(Vec<Node>, Vec<Edge>, Vec<String
 /// Cut out the substring between a `# start` marker line and the first of
 /// any `end_markers` that follows, or EOF if none matches.
 fn extract_block(src: &str, start_marker: &str, end_markers: &[&str]) -> Result<String> {
-    let mut lines = src.lines().enumerate();
-    let start = loop {
-        let Some((idx, line)) = lines.next() else {
-            bail!("start marker {start_marker:?} not found");
-        };
-        if line.trim() == start_marker {
-            break idx + 1; // first line of content
-        }
+    // Collect once and iterate twice — single pass over `src.lines()` is
+    // enough.
+    let lines: Vec<&str> = src.lines().collect();
+    let Some(start) = lines.iter().position(|l| l.trim() == start_marker) else {
+        bail!("start marker {start_marker:?} not found");
     };
-    let total = src.lines().count();
-    let mut end = total;
-    for (idx, line) in src.lines().enumerate().skip(start) {
-        let t = line.trim();
-        if end_markers.contains(&t) {
-            end = idx;
-            break;
-        }
-    }
+    let content_start = start + 1;
+    let end = lines[content_start..]
+        .iter()
+        .position(|l| end_markers.contains(&l.trim()))
+        .map_or(lines.len(), |off| content_start + off);
 
-    let block: Vec<&str> = src.lines().skip(start).take(end.saturating_sub(start)).collect();
-    Ok(block.join("\n"))
+    Ok(lines[content_start..end].join("\n"))
 }
 
 #[cfg(test)]

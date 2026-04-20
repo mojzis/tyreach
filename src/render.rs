@@ -76,39 +76,43 @@ enum CalleeGroup<'a> {
 /// Union-annotated edges emitted consecutively by the walker for the same
 /// caller are collapsed into a single `Union` group so the renderer can emit
 /// them with a `[union: a | b]` suffix.
+///
+/// Union-run continuity is detected by `from` equality *and* by
+/// pointer-stable `&str` keys borrowed directly from `edges`, so we never
+/// need to clone qnames or re-scan the slice to recover a lifetime.
 fn group_callees(edges: &[Edge]) -> HashMap<&str, Vec<CalleeGroup<'_>>> {
     let mut out: HashMap<&str, Vec<CalleeGroup<'_>>> = HashMap::new();
-    // Pending union run: the from-qname for the run and the collected edges.
-    let mut pending_union: Option<(String, Vec<&Edge>)> = None;
+    // Pending union run: the `from` key (borrowed straight from an edge) and
+    // the collected edges.
+    let mut pending_union: Option<(&str, Vec<&Edge>)> = None;
 
     for edge in edges {
+        let key = edge.from.as_str();
         let is_union = edge.annotation == Annotation::Union;
-        match (&mut pending_union, is_union) {
-            (Some((from, bucket)), true) if *from == edge.from => {
+        match (pending_union.take(), is_union) {
+            (Some((from, mut bucket)), true) if from == key => {
                 bucket.push(edge);
+                pending_union = Some((from, bucket));
             }
             (Some((from, bucket)), _) => {
-                let completed = std::mem::take(bucket);
-                let from_key = from.clone();
-                flush_union(&mut out, edges, &from_key, completed);
-                pending_union = None;
+                flush_union(&mut out, from, bucket);
                 if is_union {
-                    pending_union = Some((edge.from.clone(), vec![edge]));
+                    pending_union = Some((key, vec![edge]));
                 } else {
-                    push_single(&mut out, edges, edge);
+                    out.entry(key).or_default().push(CalleeGroup::Single(edge));
                 }
             }
             (None, true) => {
-                pending_union = Some((edge.from.clone(), vec![edge]));
+                pending_union = Some((key, vec![edge]));
             }
             (None, false) => {
-                push_single(&mut out, edges, edge);
+                out.entry(key).or_default().push(CalleeGroup::Single(edge));
             }
         }
     }
 
     if let Some((from, bucket)) = pending_union {
-        flush_union(&mut out, edges, &from, bucket);
+        flush_union(&mut out, from, bucket);
     }
 
     out
@@ -116,33 +120,13 @@ fn group_callees(edges: &[Edge]) -> HashMap<&str, Vec<CalleeGroup<'_>>> {
 
 fn flush_union<'a>(
     out: &mut HashMap<&'a str, Vec<CalleeGroup<'a>>>,
-    all_edges: &'a [Edge],
-    from: &str,
+    from: &'a str,
     edges: Vec<&'a Edge>,
 ) {
     if edges.is_empty() {
         return;
     }
-    out.entry(key_str(all_edges, from)).or_default().push(CalleeGroup::Union(edges));
-}
-
-fn push_single<'a>(
-    out: &mut HashMap<&'a str, Vec<CalleeGroup<'a>>>,
-    all_edges: &'a [Edge],
-    edge: &'a Edge,
-) {
-    out.entry(key_str(all_edges, &edge.from)).or_default().push(CalleeGroup::Single(edge));
-}
-
-/// Look up the `&str` slice for `from` in `edges`. Callers pass a `from` that
-/// was cloned from some edge, so the match always succeeds in practice.
-fn key_str<'a>(edges: &'a [Edge], from: &str) -> &'a str {
-    for edge in edges {
-        if edge.from == from {
-            return edge.from.as_str();
-        }
-    }
-    ""
+    out.entry(from).or_default().push(CalleeGroup::Union(edges));
 }
 
 fn format_callees(groups: &[CalleeGroup<'_>], nodes: &HashMap<&str, &Node>) -> String {

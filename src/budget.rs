@@ -39,9 +39,13 @@ pub fn fit_to_budget(mut snapshot: Snapshot, budget_tokens: usize) -> Snapshot {
 
     let max_iters = snapshot.nodes.len();
     for _ in 0..max_iters {
-        let Some(drop_qname) = lowest_scored_droppable(&snapshot) else {
+        let Some(drop_idx) = lowest_scored_droppable_index(&snapshot) else {
             break;
         };
+        // Clone the qname once to release the immutable borrow before we
+        // mutate the snapshot. An index + clone avoids allocating on every
+        // call via `lowest_scored_droppable`.
+        let drop_qname = snapshot.nodes[drop_idx].qname.clone();
         drop_node(&mut snapshot, &drop_qname);
         if estimate_tokens(&snapshot) <= budget_tokens {
             break;
@@ -71,22 +75,25 @@ fn estimate_tokens(snapshot: &Snapshot) -> usize {
     (node_chars + edge_chars) / CHARS_PER_TOKEN
 }
 
-/// Return the qname of the lowest-scored non-entry-point node, or `None` if
-/// nothing is left to drop.
-fn lowest_scored_droppable(snapshot: &Snapshot) -> Option<String> {
+/// Return the node-vector index of the lowest-scored non-entry-point node,
+/// or `None` if nothing is left to drop. Returning an index (rather than the
+/// qname itself) lets the caller clone the qname once at the top of its loop
+/// instead of allocating a new `String` on every call.
+fn lowest_scored_droppable_index(snapshot: &Snapshot) -> Option<usize> {
     snapshot
         .nodes
         .iter()
-        .filter_map(|n| {
+        .enumerate()
+        .filter_map(|(idx, n)| {
             let score = snapshot.scores.get(&n.qname).copied().unwrap_or(0.0);
             if score.is_infinite() {
                 None
             } else {
-                Some((n.qname.clone(), score))
+                Some((idx, score))
             }
         })
         .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(qname, _)| qname)
+        .map(|(idx, _)| idx)
 }
 
 /// Remove a node by qname and every edge that touches it.
