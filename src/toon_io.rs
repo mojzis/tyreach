@@ -1,12 +1,19 @@
 //! TOON I/O for snapshot tables.
 //!
 //! The on-disk layout is two TOON tables back-to-back (nodes, then edges),
-//! preceded by a version header comment. A blank line separates the tables
-//! so `grep`/`awk` remain happy and the file remains diffable.
+//! followed by an `[entries]` metadata list, all preceded by a version
+//! header comment. Blank lines separate the sections so `grep`/`awk` remain
+//! happy and the file remains diffable.
 //!
 //! toon-format crate 0.4.5 encodes `Vec<T>` of `serde`-derive structs as a
-//! tabular block directly; we encode each table separately and assemble the
-//! document by hand so the two blocks stay parseable in isolation.
+//! tabular block directly; we encode each section separately and assemble the
+//! document by hand so the blocks stay parseable in isolation.
+//!
+//! The `[entries]` block is a supplementary list of qnames that were
+//! walker entry points (BFS depth 0). It lets `tyreach render` reproduce
+//! the `(entry)` markers emitted by `tyreach snapshot` from the canonical
+//! TOON alone. A missing `[entries]` block (older TOON files) is tolerated
+//! and results in no entry markers.
 
 use std::io::Write;
 
@@ -18,8 +25,9 @@ use crate::model::{Edge, Node};
 const HEADER: &str = "# tyreach snapshot v1";
 const NODES_MARKER: &str = "# nodes";
 const EDGES_MARKER: &str = "# edges";
+const ENTRIES_MARKER: &str = "# entries";
 
-/// Wrappers so each table round-trips as a single top-level map (toon-format
+/// Wrappers so each section round-trips as a single top-level map (toon-format
 /// requires a named field at the document root).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct NodesDoc {
@@ -31,7 +39,13 @@ struct EdgesDoc {
     edges: Vec<Edge>,
 }
 
-/// Write nodes + edges as two TOON tables back-to-back, version-headered.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct EntriesDoc {
+    entries: Vec<String>,
+}
+
+/// Write nodes + edges + entries as three TOON sections back-to-back,
+/// version-headered.
 ///
 /// Output shape:
 ///
@@ -44,8 +58,19 @@ struct EdgesDoc {
 /// # edges
 /// edges[M]{from,to,annotation}:
 ///   ...
+///
+/// # entries
+/// entries[K]: qname1,qname2
 /// ```
-pub fn write_snapshot_toon(nodes: &[Node], edges: &[Edge], out: &mut impl Write) -> Result<()> {
+///
+/// `entries` is the list of walker entry-point qnames — consumed by
+/// `render::render` to emit `(entry)` markers. Sorted for determinism.
+pub fn write_snapshot_toon(
+    nodes: &[Node],
+    edges: &[Edge],
+    entries: &[String],
+    out: &mut impl Write,
+) -> Result<()> {
     writeln!(out, "{HEADER}").context("write TOON header")?;
     writeln!(out, "{NODES_MARKER}").context("write nodes marker")?;
 
@@ -66,27 +91,53 @@ pub fn write_snapshot_toon(nodes: &[Node], edges: &[Edge], out: &mut impl Write)
         writeln!(out).context("trailing newline")?;
     }
 
+    writeln!(out).context("blank separator")?;
+    writeln!(out, "{ENTRIES_MARKER}").context("write entries marker")?;
+
+    let mut sorted_entries = entries.to_vec();
+    sorted_entries.sort();
+    let entries_doc = EntriesDoc { entries: sorted_entries };
+    let encoded_entries = toon_format::encode_default(&entries_doc).context("encode entries")?;
+    out.write_all(encoded_entries.as_bytes()).context("write entries block")?;
+    if !encoded_entries.ends_with('\n') {
+        writeln!(out).context("trailing newline")?;
+    }
+
     Ok(())
 }
 
-/// Parse a two-table snapshot document back into `(nodes, edges)`.
-pub fn read_snapshot_toon(src: &str) -> Result<(Vec<Node>, Vec<Edge>)> {
-    let nodes_block = extract_block(src, NODES_MARKER, Some(EDGES_MARKER))
+/// Parse a snapshot document back into `(nodes, edges, entries)`.
+///
+/// The `entries` block is optional: older TOON files without it parse fine
+/// and yield an empty entries list (so `render` will emit no entry markers).
+pub fn read_snapshot_toon(src: &str) -> Result<(Vec<Node>, Vec<Edge>, Vec<String>)> {
+    let nodes_block = extract_block(src, NODES_MARKER, &[EDGES_MARKER, ENTRIES_MARKER])
         .context("nodes block missing from snapshot")?;
-    let edges_block =
-        extract_block(src, EDGES_MARKER, None).context("edges block missing from snapshot")?;
+    let edges_block = extract_block(src, EDGES_MARKER, &[ENTRIES_MARKER])
+        .context("edges block missing from snapshot")?;
 
     let nodes_doc: NodesDoc =
         toon_format::decode_default(&nodes_block).context("decode nodes block")?;
     let edges_doc: EdgesDoc =
         toon_format::decode_default(&edges_block).context("decode edges block")?;
 
-    Ok((nodes_doc.nodes, edges_doc.edges))
+    let entries = match extract_block(src, ENTRIES_MARKER, &[]) {
+        Ok(block) if block.trim().is_empty() => Vec::new(),
+        Ok(block) => {
+            let entries_doc: EntriesDoc =
+                toon_format::decode_default(&block).context("decode entries block")?;
+            entries_doc.entries
+        }
+        // Missing entries block is allowed (backward-compat with older TOON).
+        Err(_) => Vec::new(),
+    };
+
+    Ok((nodes_doc.nodes, edges_doc.edges, entries))
 }
 
-/// Cut out the substring between a `# start` marker line and either the `end`
-/// marker or EOF.
-fn extract_block(src: &str, start_marker: &str, end_marker: Option<&str>) -> Result<String> {
+/// Cut out the substring between a `# start` marker line and the first of
+/// any `end_markers` that follows, or EOF if none matches.
+fn extract_block(src: &str, start_marker: &str, end_markers: &[&str]) -> Result<String> {
     let mut lines = src.lines().enumerate();
     let start = loop {
         let Some((idx, line)) = lines.next() else {
@@ -96,18 +147,15 @@ fn extract_block(src: &str, start_marker: &str, end_marker: Option<&str>) -> Res
             break idx + 1; // first line of content
         }
     };
-    let end = if let Some(marker) = end_marker {
-        let mut end_idx = src.lines().count();
-        for (idx, line) in src.lines().enumerate().skip(start) {
-            if line.trim() == marker {
-                end_idx = idx;
-                break;
-            }
+    let total = src.lines().count();
+    let mut end = total;
+    for (idx, line) in src.lines().enumerate().skip(start) {
+        let t = line.trim();
+        if end_markers.contains(&t) {
+            end = idx;
+            break;
         }
-        end_idx
-    } else {
-        src.lines().count()
-    };
+    }
 
     let block: Vec<&str> = src.lines().skip(start).take(end.saturating_sub(start)).collect();
     Ok(block.join("\n"))
@@ -148,38 +196,79 @@ mod tests {
     }
 
     #[test]
-    fn round_trips_two_tables() {
+    fn round_trips_three_sections() {
         let nodes = sample_nodes();
         let edges = sample_edges();
+        let entries = vec!["app.main.main".to_owned()];
 
         let mut buf = Vec::new();
-        write_snapshot_toon(&nodes, &edges, &mut buf).expect("write");
+        write_snapshot_toon(&nodes, &edges, &entries, &mut buf).expect("write");
         let text = String::from_utf8(buf).expect("utf8");
 
         assert!(text.starts_with(HEADER), "must start with version header");
         assert!(text.contains(NODES_MARKER));
         assert!(text.contains(EDGES_MARKER));
+        assert!(text.contains(ENTRIES_MARKER));
         assert!(text.contains("qname"));
         assert!(text.contains("from"));
 
-        let (n2, e2) = read_snapshot_toon(&text).expect("read");
+        let (n2, e2, ents2) = read_snapshot_toon(&text).expect("read");
         assert_eq!(n2, nodes);
         assert_eq!(e2, edges);
+        assert_eq!(ents2, entries);
     }
 
     #[test]
-    fn round_trips_empty_tables() {
+    fn round_trips_empty_sections() {
         let mut buf = Vec::new();
-        write_snapshot_toon(&[], &[], &mut buf).expect("write");
+        write_snapshot_toon(&[], &[], &[], &mut buf).expect("write");
         let text = String::from_utf8(buf).expect("utf8");
-        let (n2, e2) = read_snapshot_toon(&text).expect("read");
+        let (n2, e2, ents2) = read_snapshot_toon(&text).expect("read");
         assert!(n2.is_empty());
         assert!(e2.is_empty());
+        assert!(ents2.is_empty());
+    }
+
+    #[test]
+    fn reads_legacy_toon_without_entries_block() {
+        // TOON written by an older tyreach (no `# entries` section) must still
+        // parse — renders just won't emit any `(entry)` marker. We generate
+        // the legacy shape by writing with an empty entries list, then
+        // stripping the `# entries` section from the resulting text.
+        let nodes = sample_nodes();
+        let edges = sample_edges();
+        let mut buf = Vec::new();
+        write_snapshot_toon(&nodes, &edges, &[], &mut buf).expect("write");
+        let full = String::from_utf8(buf).expect("utf8");
+        let legacy = full
+            .split_once(ENTRIES_MARKER)
+            .map_or_else(|| full.clone(), |(before, _)| before.trim_end().to_owned() + "\n");
+        assert!(!legacy.contains(ENTRIES_MARKER), "precondition: no entries marker");
+
+        let (n, e, ents) = read_snapshot_toon(&legacy).expect("read legacy");
+        assert_eq!(n, nodes);
+        assert_eq!(e, edges);
+        assert!(ents.is_empty(), "legacy TOON must yield empty entries");
     }
 
     #[test]
     fn read_missing_markers_errors() {
         let bad = "this is not a tyreach snapshot\n";
         assert!(read_snapshot_toon(bad).is_err());
+    }
+
+    #[test]
+    fn entries_written_sorted_for_determinism() {
+        let nodes = sample_nodes();
+        let edges = sample_edges();
+        let entries = vec!["z.z".to_owned(), "a.a".to_owned(), "m.m".to_owned()];
+
+        let mut buf = Vec::new();
+        write_snapshot_toon(&nodes, &edges, &entries, &mut buf).expect("write");
+        let text = String::from_utf8(buf).expect("utf8");
+        let a_pos = text.find("a.a").expect("a.a present");
+        let m_pos = text.find("m.m").expect("m.m present");
+        let z_pos = text.find("z.z").expect("z.z present");
+        assert!(a_pos < m_pos && m_pos < z_pos, "entries must be written sorted: {text}");
     }
 }

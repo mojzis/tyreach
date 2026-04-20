@@ -14,3 +14,6 @@ edges[5]{from,to,annotation}:
   medium_app.a.run_a,json.dumps,external
   medium_app.a.run_a,medium_app.shared.util,resolved
   medium_app.b.run_b,medium_app.shared.util,resolved
+
+# entries
+entries[1]: medium_app.main.main

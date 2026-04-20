@@ -141,11 +141,24 @@ fn write_toon_file(snapshot: &Snapshot, prefix: &Path) -> Result<()> {
     let path = with_extension(prefix, "toon");
     let file = fs::File::create(&path).with_context(|| format!("create {}", path.display()))?;
     let mut writer = BufWriter::new(file);
-    write_snapshot_toon(&snapshot.nodes, &snapshot.edges, &mut writer)
+    let entries = entry_qnames(snapshot);
+    write_snapshot_toon(&snapshot.nodes, &snapshot.edges, &entries, &mut writer)
         .with_context(|| format!("write {}", path.display()))?;
     tracing::info!("wrote {}", path.display());
     println!("wrote {}", path.display());
     Ok(())
+}
+
+/// Entry-point qnames = nodes at BFS depth 0. Sorted so callers don't have
+/// to care about ordering; `write_snapshot_toon` also sorts defensively.
+fn entry_qnames(snapshot: &Snapshot) -> Vec<String> {
+    let mut v: Vec<String> = snapshot
+        .depth_by_qname
+        .iter()
+        .filter_map(|(q, d)| if *d == 0 { Some(q.clone()) } else { None })
+        .collect();
+    v.sort();
+    v
 }
 
 fn write_rendered_file(snapshot: &Snapshot, prefix: &Path) -> Result<()> {
@@ -178,12 +191,14 @@ fn run_render(input: Option<&Path>) -> Result<()> {
         buf
     };
 
-    let (nodes, edges) = read_snapshot_toon(&text).context("parse TOON snapshot")?;
-    // Re-render goes through a minimal Snapshot; scoring/truncation are not
-    // re-derived (not serialized in on-disk TOON). Entry-point markers
-    // therefore are not emitted — the on-disk snapshot is the canonical
-    // record, not the walker state.
-    let snapshot = Snapshot { nodes, edges, ..Snapshot::default() };
+    let (nodes, edges, entries) = read_snapshot_toon(&text).context("parse TOON snapshot")?;
+    // Re-render goes through a minimal Snapshot; scoring and truncation are
+    // not re-derived (they're walker-state, not canonical). Entry points ARE
+    // carried on-disk via the `[entries]` list, so we reconstruct a
+    // depth-0-only `depth_by_qname` — enough for `render` to emit the
+    // `(entry)` markers `tyreach snapshot` wrote.
+    let depth_by_qname = entries.iter().map(|q| (q.clone(), 0_u32)).collect();
+    let snapshot = Snapshot { nodes, edges, depth_by_qname, ..Snapshot::default() };
     let stdout = io::stdout();
     let mut handle = stdout.lock();
     render(&snapshot, &mut handle).context("render")?;

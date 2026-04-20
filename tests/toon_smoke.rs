@@ -36,12 +36,15 @@ fn round_trips_realistic_snapshot() {
         },
     ];
 
+    let entries = vec!["tiny_app.main.main".to_string()];
+
     let mut buf = Vec::new();
-    write_snapshot_toon(&nodes, &edges, &mut buf).expect("encode");
+    write_snapshot_toon(&nodes, &edges, &entries, &mut buf).expect("encode");
     let encoded = String::from_utf8(buf).expect("utf8");
     assert!(!encoded.is_empty(), "encoder produced an empty document");
 
-    let (nodes_out, edges_out) = read_snapshot_toon(&encoded).expect("decode");
+    let (nodes_out, edges_out, entries_out) = read_snapshot_toon(&encoded).expect("decode");
     assert_eq!(nodes_out, nodes, "nodes must round-trip");
     assert_eq!(edges_out, edges, "edges must round-trip");
+    assert_eq!(entries_out, entries, "entries must round-trip");
 }
