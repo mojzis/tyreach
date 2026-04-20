@@ -1,0 +1,18 @@
+# cargo-release configuration
+# Usage: cargo release patch|minor|major
+
+# Create a git tag for the release
+tag = true
+tag-message = "Release {{version}}"
+
+# Commit message for the version bump
+pre-release-commit-message = "Release v{{version}}"
+
+# Push the commit and tag to the remote
+push = true
+
+# Don't try to publish to crates.io (we distribute via Python/maturin)
+publish = false
+
+# Run pre-release checks
+verify = true

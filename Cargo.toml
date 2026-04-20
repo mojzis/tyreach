@@ -1,0 +1,86 @@
+[package]
+name = "tyreach"
+version = "0.0.1"
+edition = "2021"
+description = "Ranked, token-budgeted reachability snapshot of Python symbols via tree-sitter + ty LSP"
+license = "MIT"
+repository = "https://github.com/mojzis/tyreach"
+keywords = ["python", "reachability", "call-graph", "lsp", "static-analysis"]
+categories = ["development-tools", "command-line-utilities"]
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_repr = "0.1"
+clap = { version = "4.5", features = ["derive", "color"] }
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tree-sitter = "0.26"
+tree-sitter-python = "0.25"
+rayon = "1.10"
+ignore = "0.4"
+toml = "0.8"
+tokio = { version = "1", features = ["full"] }
+toon-format = { version = "0.4.5", default-features = false }
+
+[dev-dependencies]
+tempfile = "3.26"
+assert_cmd = "2.1"
+predicates = "3.1"
+
+[lib]
+name = "tyreach"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tyreach"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+
+# Cherry-picked restriction lints
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+undocumented_unsafe_blocks = "warn"
+clone_on_ref_ptr = "warn"
+exit = "warn"
+await_holding_lock = "warn"
+large_futures = "warn"
+allow_attributes_without_reason = "warn"
+missing_assert_message = "warn"
+
+# Cargo group allows
+multiple_crate_versions = "allow"
+
+# Pedantic allows (too noisy)
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+cast_precision_loss = "allow"
+struct_excessive_bools = "allow"
+implicit_hasher = "allow"
+
+# Nursery allows (unstable/buggy lints)
+missing_const_for_fn = "allow"
+significant_drop_tightening = "allow"
+option_if_let_else = "allow"
+future_not_send = "allow"
