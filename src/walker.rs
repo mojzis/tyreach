@@ -144,7 +144,7 @@ impl<'a> Walker<'a> {
             return Ok(());
         }
 
-        let signature = fetch_signature(self.client, &file_str, name_line, name_char).await;
+        let signature = fetch_hover_first_line(self.client, &file_str, name_line, name_char).await;
         let rel_file = relative_to_root(&item.file, &self.repo_root);
         let line = fn_row.saturating_add(1);
 
@@ -240,19 +240,13 @@ impl<'a> Walker<'a> {
             }
             Kind::External => {
                 let qname = qname_for(&target_path, &self.repo_root, &cs.callee_text);
-                let signature = match timeout(
-                    GOTO_TIMEOUT,
-                    self.client.hover(
-                        &target_path.to_string_lossy(),
-                        loc.range.start.line,
-                        loc.range.start.character,
-                    ),
+                let signature = fetch_hover_first_line(
+                    self.client,
+                    &target_path.to_string_lossy(),
+                    loc.range.start.line,
+                    loc.range.start.character,
                 )
-                .await
-                {
-                    Ok(Ok(Some(h))) => hover_first_line(&h),
-                    _ => String::new(),
-                };
+                .await;
                 self.ensure_node(Node {
                     qname: qname.clone(),
                     signature,
@@ -452,10 +446,28 @@ fn extract_docstring_first_line(raw: &str) -> String {
     inner.lines().next().unwrap_or("").trim().to_owned()
 }
 
-async fn fetch_signature(client: &TyLspClient, file: &str, line: u32, character: u32) -> String {
+/// Fetch a hover and return the first non-fence line, or an empty string.
+///
+/// Timeouts and LSP errors are logged at `warn` and collapse to `""` so the
+/// walker can continue. `None` hover contents collapse silently (ty returned
+/// nothing for the position — normal for unresolvable identifiers).
+async fn fetch_hover_first_line(
+    client: &TyLspClient,
+    file: &str,
+    line: u32,
+    character: u32,
+) -> String {
     match timeout(GOTO_TIMEOUT, client.hover(file, line, character)).await {
         Ok(Ok(Some(h))) => hover_first_line(&h),
-        _ => String::new(),
+        Ok(Ok(None)) => String::new(),
+        Ok(Err(err)) => {
+            tracing::warn!("hover error at {file}:{line}: {err}");
+            String::new()
+        }
+        Err(_) => {
+            tracing::warn!("hover timeout at {file}:{line}");
+            String::new()
+        }
     }
 }
 
@@ -532,5 +544,31 @@ mod tests {
     fn uri_roundtrip() {
         assert_eq!(uri_to_path("file:///tmp/x.py"), Some(PathBuf::from("/tmp/x.py")));
         assert_eq!(uri_to_path("http://example"), None);
+    }
+
+    #[test]
+    fn find_function_line_hint_picks_closest() {
+        use crate::parse::parse_bytes;
+        // Two functions share the name `foo`; the hint must disambiguate.
+        let src = "class A:\n    def foo(self):\n        pass\n\nclass B:\n    def foo(self):\n        return 1\n";
+        let parsed = parse_bytes(src.as_bytes().to_vec(), PathBuf::from("t.py")).expect("parse");
+
+        // Hint points at the second `foo` (row 5). Best-diff selection must
+        // return the closer definition.
+        let node = find_function_definition(&parsed, "foo", Some(5)).expect("some match");
+        assert_eq!(node.start_position().row, 5);
+
+        // Hint at row 1 returns the first `foo`.
+        let node = find_function_definition(&parsed, "foo", Some(1)).expect("some match");
+        assert_eq!(node.start_position().row, 1);
+    }
+
+    #[test]
+    fn find_function_no_hint_returns_some_match() {
+        use crate::parse::parse_bytes;
+        let src = "def alpha():\n    pass\n\ndef beta():\n    pass\n";
+        let parsed = parse_bytes(src.as_bytes().to_vec(), PathBuf::from("t.py")).expect("parse");
+        assert!(find_function_definition(&parsed, "alpha", None).is_some());
+        assert!(find_function_definition(&parsed, "missing", None).is_none());
     }
 }

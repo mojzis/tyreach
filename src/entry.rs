@@ -218,4 +218,37 @@ demo = "demo.main:run"
         let dir = tempfile::tempdir().expect("tempdir");
         assert!(parse_cli_entry("nope.py::fn", dir.path()).is_err());
     }
+
+    #[test]
+    fn malformed_pyproject_yields_empty_not_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Unterminated table header — toml parser will reject.
+        std::fs::write(dir.path().join("pyproject.toml"), "[project\nname = broken\n")
+            .expect("write");
+        // Per contract, a malformed pyproject.toml should not propagate the
+        // parse error; the function logs and returns an empty vec so the CLI
+        // can still accept `--entry` arguments.
+        let entries = detect_entries(dir.path()).expect("detect");
+        assert!(entries.is_empty(), "malformed pyproject must not yield entries");
+    }
+
+    #[test]
+    fn unresolvable_script_spec_is_skipped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // script points at a module that has no .py file anywhere under the root.
+        std::fs::write(
+            dir.path().join("pyproject.toml"),
+            r#"
+[project]
+name = "demo"
+version = "0.1.0"
+
+[project.scripts]
+demo = "nonexistent.module:run"
+"#,
+        )
+        .expect("write");
+        let entries = detect_entries(dir.path()).expect("detect");
+        assert!(entries.is_empty(), "unresolvable script spec must be skipped silently");
+    }
 }
