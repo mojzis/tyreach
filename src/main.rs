@@ -33,8 +33,8 @@ enum Command {
         #[arg(value_name = "REPO", default_value = ".")]
         repo: PathBuf,
         /// Explicit entry point `path/to/file.py::func` (repeatable). When
-        /// omitted, entry points are auto-detected from
-        /// `pyproject.toml [project.scripts]`.
+        /// omitted, entry points are read from `tyreach.toml` (if present) or
+        /// auto-detected from `pyproject.toml [project.scripts]`.
         #[arg(long = "entry")]
         entries: Vec<String>,
         /// Token budget. Nodes are dropped in ascending score order until the
@@ -178,15 +178,47 @@ fn run_render(input: Option<&Path>) -> Result<()> {
     };
 
     let (nodes, edges, entries) = read_snapshot_toon(&text).context("parse TOON snapshot")?;
-    // Re-render goes through a minimal Snapshot; scoring and truncation are
-    // not re-derived (they're walker-state, not canonical). Entry points ARE
-    // carried on-disk via the `[entries]` list, so we reconstruct a
-    // depth-0-only `depth_by_qname` — enough for `render` to emit the
-    // `(entry)` markers `tyreach snapshot` wrote.
-    let depth_by_qname = entries.iter().map(|q| (q.clone(), 0_u32)).collect();
-    let snapshot = Snapshot { nodes, edges, depth_by_qname, ..Snapshot::default() };
+    // Re-render reconstructs scoring from the canonical TOON so the output is
+    // bit-identical to `tyreach snapshot`'s rendered view (modulo ties that
+    // depend on walk order — edges here are already in canonical order).
+    //
+    //   1. BFS from the `entries` over `edges` to recover `depth_by_qname`.
+    //   2. Re-run `rank` — it's a pure function of (depth_by_qname, edges).
+    //
+    // Truncation metadata is not carried on-disk (walker-state only); we pass
+    // the default `None`.
+    let depth_by_qname = reconstruct_depths(&entries, &edges);
+    let mut snapshot = Snapshot { nodes, edges, depth_by_qname, ..Snapshot::default() };
+    rank(&mut snapshot);
     let stdout = io::stdout();
     let mut handle = stdout.lock();
     render(&snapshot, &mut handle).context("render")?;
     Ok(())
+}
+
+/// BFS over `edges` starting from `entries` (depth 0). Unreachable qnames get
+/// no entry in the returned map; `rank::rank` already handles `None` depths by
+/// scoring on fan-in alone.
+fn reconstruct_depths(
+    entries: &[String],
+    edges: &[tyreach::model::Edge],
+) -> std::collections::HashMap<String, u32> {
+    use std::collections::{HashMap, VecDeque};
+
+    let mut depth: HashMap<String, u32> = HashMap::new();
+    let mut queue: VecDeque<String> = VecDeque::new();
+    for entry in entries {
+        depth.insert(entry.clone(), 0);
+        queue.push_back(entry.clone());
+    }
+    while let Some(qname) = queue.pop_front() {
+        let next_depth = depth.get(&qname).copied().unwrap_or(0).saturating_add(1);
+        for edge in edges.iter().filter(|e| e.from == qname) {
+            if !depth.contains_key(&edge.to) {
+                depth.insert(edge.to.clone(), next_depth);
+                queue.push_back(edge.to.clone());
+            }
+        }
+    }
+    depth
 }

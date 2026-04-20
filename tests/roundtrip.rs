@@ -18,7 +18,7 @@
     reason = "integration-test helpers; failures should fail loudly"
 )]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use tyreach::model::{Annotation, Edge, Kind, Node};
 use tyreach::rank;
@@ -68,6 +68,27 @@ fn strip_trailing_ws(s: &str) -> String {
         out.push('\n');
     }
     out
+}
+
+/// BFS from entries over edges to rebuild `depth_by_qname`. Mirrors the
+/// reconstruction `tyreach render` performs when re-rendering a TOON file.
+fn reconstruct_depths(entries: &[String], edges: &[Edge]) -> HashMap<String, u32> {
+    let mut depth: HashMap<String, u32> = HashMap::new();
+    let mut queue: VecDeque<String> = VecDeque::new();
+    for q in entries {
+        depth.insert(q.clone(), 0);
+        queue.push_back(q.clone());
+    }
+    while let Some(q) = queue.pop_front() {
+        let next = depth.get(&q).copied().unwrap_or(0).saturating_add(1);
+        for e in edges.iter().filter(|e| e.from == q) {
+            if !depth.contains_key(&e.to) {
+                depth.insert(e.to.clone(), next);
+                queue.push_back(e.to.clone());
+            }
+        }
+    }
+    depth
 }
 
 fn entry_qnames(snap: &Snapshot) -> Vec<String> {
@@ -151,5 +172,81 @@ fn toon_roundtrip_preserves_rendered_view_including_entry_markers() {
         strip_trailing_ws(&text_first),
         strip_trailing_ws(&text_second),
         "TOON must be bit-identical after a read+write round-trip"
+    );
+}
+
+/// Rank-aware roundtrip: `snapshot -> rank -> render` must equal
+/// `snapshot -> write -> read -> reconstruct-depths -> rank -> render`.
+///
+/// This covers the case the trivial roundtrip test misses: when non-entry
+/// nodes have meaningful depth (and therefore meaningful rank scores), the
+/// re-renderer must reconstruct depth via BFS so the topo-sort tie-breaks
+/// line up with what `tyreach snapshot` wrote. Without depth reconstruction,
+/// every non-entry falls to `f64::NEG_INFINITY` and the render reorders.
+#[test]
+fn rank_aware_roundtrip_preserves_render_order() {
+    // Layout:
+    //   root -> (a, b)
+    //   a    -> shared      (depth 2)
+    //   b    -> shared      (depth 2)
+    //   root -> deep        (depth 1)
+    //   deep -> deeper      (depth 2)
+    //   deeper -> deepest   (depth 3)
+    //
+    // `shared` has fan-in 2 so it outscores its depth-2 peer `deeper`. A
+    // naive re-render without depth reconstruction treats every non-entry as
+    // NEG_INFINITY and sorts alphabetically, reversing the documented order.
+    let nodes = vec![
+        internal("app.root", "def root()", ""),
+        internal("app.a", "def a()", ""),
+        internal("app.b", "def b()", ""),
+        internal("app.shared", "def shared()", ""),
+        internal("app.deep", "def deep()", ""),
+        internal("app.deeper", "def deeper()", ""),
+        internal("app.deepest", "def deepest()", ""),
+    ];
+    let edges = vec![
+        edge("app.root", "app.a", Annotation::Resolved),
+        edge("app.root", "app.b", Annotation::Resolved),
+        edge("app.root", "app.deep", Annotation::Resolved),
+        edge("app.a", "app.shared", Annotation::Resolved),
+        edge("app.b", "app.shared", Annotation::Resolved),
+        edge("app.deep", "app.deeper", Annotation::Resolved),
+        edge("app.deeper", "app.deepest", Annotation::Resolved),
+    ];
+
+    let depth_by_qname = HashMap::from([
+        ("app.root".to_owned(), 0_u32),
+        ("app.a".to_owned(), 1),
+        ("app.b".to_owned(), 1),
+        ("app.shared".to_owned(), 2),
+        ("app.deep".to_owned(), 1),
+        ("app.deeper".to_owned(), 2),
+        ("app.deepest".to_owned(), 3),
+    ]);
+    let mut original = Snapshot { nodes, edges, depth_by_qname, ..Snapshot::default() };
+    rank::rank(&mut original);
+    let rendered_original = render_str(&original);
+
+    // Serialize, read back, reconstruct depths, re-rank, render.
+    let entries_written = entry_qnames(&original);
+    let mut buf = Vec::new();
+    write_snapshot_toon(&original.nodes, &original.edges, &entries_written, &mut buf)
+        .expect("write");
+    let text = String::from_utf8(buf).expect("utf8");
+    let (nodes_back, edges_back, entries_back) = read_snapshot_toon(&text).expect("read");
+    let depths_back = reconstruct_depths(&entries_back, &edges_back);
+    let mut reloaded = Snapshot {
+        nodes: nodes_back,
+        edges: edges_back,
+        depth_by_qname: depths_back,
+        ..Snapshot::default()
+    };
+    rank::rank(&mut reloaded);
+    let rendered_reloaded = render_str(&reloaded);
+
+    assert_eq!(
+        rendered_original, rendered_reloaded,
+        "rank-aware re-render must match original render byte-for-byte\n--- original ---\n{rendered_original}\n--- reloaded ---\n{rendered_reloaded}"
     );
 }

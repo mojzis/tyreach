@@ -37,8 +37,11 @@ cd myrepo
 tyreach snapshot
 ```
 
-Writes `myrepo.toon` (canonical TOON) and `myrepo.txt` (rendered view) next
-to each other. A typical rendered snippet:
+Writes `<script>.toon` (canonical TOON) and `<script>.txt` (rendered view)
+side-by-side, where `<script>` is the first entry's name — the key from
+`[project.scripts]` (so a `myapp = "myapp.cli:main"` block produces
+`myapp.toon` / `myapp.txt`). Override with `--out PREFIX` to pick an
+explicit prefix. A typical rendered snippet:
 
 ```text
 myapp.cli.main  (entry)
@@ -62,7 +65,7 @@ tyreach snapshot --stdout
 Re-render a previously written `.toon`:
 
 ```sh
-tyreach render myrepo.toon
+tyreach render myapp.toon
 ```
 
 ## Configuration
