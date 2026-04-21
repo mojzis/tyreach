@@ -53,7 +53,9 @@ impl Classifier {
             }
         };
 
-        if canonical.starts_with(&self.repo_root) {
+        if canonical.starts_with(&self.repo_root)
+            && !canonical.components().any(|c| c.as_os_str() == "site-packages")
+        {
             Kind::Internal
         } else {
             Kind::External
@@ -99,6 +101,17 @@ mod tests {
 
         let kind = classify(&missing, root.path()).expect("classify");
         assert_eq!(kind, Kind::Unresolved);
+    }
+
+    #[test]
+    fn site_packages_under_root_is_external() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join(".venv/lib/python3.13/site-packages/pandas/core/frame.py");
+        std::fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&file, "x = 1\n").expect("write");
+
+        let kind = classify(&file, dir.path()).expect("classify");
+        assert_eq!(kind, Kind::External);
     }
 
     #[test]
