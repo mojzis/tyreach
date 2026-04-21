@@ -41,8 +41,12 @@ fn edge(from: &str, to: &str, ann: Annotation) -> Edge {
 }
 
 fn render_str(snapshot: &Snapshot) -> String {
+    render_str_with(snapshot, false)
+}
+
+fn render_str_with(snapshot: &Snapshot, with_builtins: bool) -> String {
     let mut buf = Vec::new();
-    render(snapshot, &mut buf).expect("render");
+    render(snapshot, &mut buf, with_builtins).expect("render");
     String::from_utf8(buf).expect("utf8")
 }
 
@@ -104,6 +108,94 @@ fn topological_order_places_caller_before_callees_with_markers() {
     for line in text.lines() {
         assert!(line != "os.environ.get", "external leaf appeared standalone: {text}");
     }
+}
+
+#[test]
+fn union_dedups_duplicate_targets_order_preserving() {
+    // `main` has one union call site whose edges name `impl_a` three times
+    // plus `impl_b` once. Rendered union must list each target exactly once,
+    // first-occurrence-wins, so: `impl_a | impl_b`.
+    let mut snap = Snapshot {
+        nodes: vec![internal("main"), internal("impl_a"), internal("impl_b")],
+        edges: vec![
+            edge("main", "impl_a", Annotation::Union),
+            edge("main", "impl_a", Annotation::Union),
+            edge("main", "impl_a", Annotation::Union),
+            edge("main", "impl_b", Annotation::Union),
+        ],
+        depth_by_qname: HashMap::from([
+            ("main".to_owned(), 0),
+            ("impl_a".to_owned(), 1),
+            ("impl_b".to_owned(), 1),
+        ]),
+        ..Snapshot::default()
+    };
+    rank::rank(&mut snap);
+    let text = render_str(&snap);
+
+    // Find the union suffix and count occurrences of `impl_a` inside it.
+    let union_start = text.find("[union:").expect("union marker present");
+    let union_end = text[union_start..].find(']').expect("union marker closed");
+    let union_segment = &text[union_start..union_start + union_end];
+    let impl_a_count = union_segment.matches("impl_a").count();
+    assert_eq!(impl_a_count, 1, "impl_a should appear once inside union: {union_segment}");
+    assert!(union_segment.contains("impl_b"), "impl_b must remain in union: {union_segment}");
+    // Order-preserving: impl_a before impl_b.
+    let a_pos = union_segment.find("impl_a").unwrap();
+    let b_pos = union_segment.find("impl_b").unwrap();
+    assert!(a_pos < b_pos, "first-occurrence-wins ordering broken: {union_segment}");
+}
+
+#[test]
+fn noisy_builtin_filtered_by_default() {
+    // `builtins.print` must not leak into rendered output when with_builtins=false.
+    let mut snap = Snapshot {
+        nodes: vec![internal("main"), external("builtins.print"), internal("helper")],
+        edges: vec![
+            edge("main", "builtins.print", Annotation::External),
+            edge("main", "helper", Annotation::Resolved),
+        ],
+        depth_by_qname: HashMap::from([("main".to_owned(), 0), ("helper".to_owned(), 1)]),
+        ..Snapshot::default()
+    };
+    rank::rank(&mut snap);
+    let text = render_str(&snap);
+    assert!(!text.contains("print"), "builtins.print must be filtered by default: {text}");
+    assert!(text.contains("helper"), "non-builtin edges must still render: {text}");
+}
+
+#[test]
+fn noisy_builtin_surfaced_with_opt_in() {
+    // Same snapshot as above but with_builtins=true — print must appear.
+    let mut snap = Snapshot {
+        nodes: vec![internal("main"), external("builtins.print"), internal("helper")],
+        edges: vec![
+            edge("main", "builtins.print", Annotation::External),
+            edge("main", "helper", Annotation::Resolved),
+        ],
+        depth_by_qname: HashMap::from([("main".to_owned(), 0), ("helper".to_owned(), 1)]),
+        ..Snapshot::default()
+    };
+    rank::rank(&mut snap);
+    let text = render_str_with(&snap, true);
+    assert!(text.contains("print"), "--with-builtins must surface builtins.print: {text}");
+}
+
+#[test]
+fn function_with_only_filtered_builtin_renders_header_no_arrow() {
+    // `main` calls only `builtins.print`. With default filtering the
+    // function header must still appear but no `->` line.
+    let mut snap = Snapshot {
+        nodes: vec![internal("main"), external("builtins.print")],
+        edges: vec![edge("main", "builtins.print", Annotation::External)],
+        depth_by_qname: HashMap::from([("main".to_owned(), 0)]),
+        ..Snapshot::default()
+    };
+    rank::rank(&mut snap);
+    let text = render_str(&snap);
+    assert!(text.contains("main"), "main header must be present: {text}");
+    assert!(!text.contains("->"), "no arrow line when all edges filtered: {text}");
+    assert!(!text.contains("print"), "builtins.print must be filtered: {text}");
 }
 
 #[test]

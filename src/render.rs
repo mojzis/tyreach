@@ -17,8 +17,30 @@ use anyhow::{Context, Result};
 use crate::model::{Annotation, Edge, Kind, Node};
 use crate::walker::Snapshot;
 
+/// Noisy builtin / ubiquitous call targets dropped from rendered `.txt`.
+///
+/// These targets (`builtins.print`, `Path`, `mkdir`, ...) flood output with
+/// low-signal edges. Filtered by default; opt back in with `--with-builtins`
+/// on `snapshot` / `render`.
+///
+/// Deliberately a small, hand-curated allowlist rather than a blanket
+/// `builtins.*` prefix: the goal is to drop the handful of targets that
+/// actually dominate rendered output without silently hiding useful edges.
+pub const NOISY_BUILTINS: &[&str] =
+    &["builtins.print", "builtins.len", "builtins.str", "builtins.open", "Path", "mkdir"];
+
+/// Whether `qname` matches the `NOISY_BUILTINS` allowlist exactly.
+pub fn is_noisy_builtin(qname: &str) -> bool {
+    NOISY_BUILTINS.contains(&qname)
+}
+
 /// Render the snapshot as the topologically-sorted text view.
-pub fn render(snapshot: &Snapshot, out: &mut impl Write) -> Result<()> {
+///
+/// `with_builtins = false` drops `NOISY_BUILTINS` edges from both single
+/// callee lines and union lists, and dedups duplicate targets inside a
+/// single `[union: ...]` (order-preserving — first occurrence wins). The
+/// `.toon` is untouched; hygiene is render-only.
+pub fn render(snapshot: &Snapshot, out: &mut impl Write, with_builtins: bool) -> Result<()> {
     let node_by_qname: HashMap<&str, &Node> =
         snapshot.nodes.iter().map(|n| (n.qname.as_str(), n)).collect();
 
@@ -54,7 +76,7 @@ pub fn render(snapshot: &Snapshot, out: &mut impl Write) -> Result<()> {
         }
 
         if let Some(rows) = groups {
-            let line = format_callees(rows, &node_by_qname);
+            let line = format_callees(rows, &node_by_qname, with_builtins);
             if !line.is_empty() {
                 writeln!(out, "  -> {line}").context("write callees")?;
             }
@@ -129,11 +151,18 @@ fn flush_union<'a>(
     out.entry(from).or_default().push(CalleeGroup::Union(edges));
 }
 
-fn format_callees(groups: &[CalleeGroup<'_>], nodes: &HashMap<&str, &Node>) -> String {
+fn format_callees(
+    groups: &[CalleeGroup<'_>],
+    nodes: &HashMap<&str, &Node>,
+    with_builtins: bool,
+) -> String {
     let mut parts: Vec<String> = Vec::new();
     for group in groups {
         match group {
             CalleeGroup::Single(edge) => {
+                if !with_builtins && is_noisy_builtin(edge.to.as_str()) {
+                    continue;
+                }
                 let display = unresolved_display_for(edge.to.as_str());
                 let suffix = match edge.annotation {
                     Annotation::External => " [ext]",
@@ -143,7 +172,14 @@ fn format_callees(groups: &[CalleeGroup<'_>], nodes: &HashMap<&str, &Node>) -> S
                 parts.push(format!("{display}{suffix}"));
             }
             CalleeGroup::Union(edges) => {
-                let names: Vec<String> = edges
+                // Filter BEFORE dedup so `[union: print | print | foo]`
+                // collapses to `foo` under the default filter instead of
+                // leaking a single `print` through dedup.
+                let filtered: Vec<&&Edge> = edges
+                    .iter()
+                    .filter(|e| with_builtins || !is_noisy_builtin(e.to.as_str()))
+                    .collect();
+                let names: Vec<String> = filtered
                     .iter()
                     .map(|e| {
                         let display = unresolved_display_for(e.to.as_str());
@@ -159,8 +195,14 @@ fn format_callees(groups: &[CalleeGroup<'_>], nodes: &HashMap<&str, &Node>) -> S
                 if names.is_empty() {
                     continue;
                 }
-                let heading = &names[0];
-                parts.push(format!("{heading} [union: {}]", names.join(" | ")));
+                let mut seen: HashSet<String> = HashSet::new();
+                let deduped: Vec<String> =
+                    names.into_iter().filter(|n| seen.insert(n.clone())).collect();
+                if deduped.is_empty() {
+                    continue;
+                }
+                let heading = deduped[0].clone();
+                parts.push(format!("{heading} [union: {}]", deduped.join(" | ")));
             }
         }
     }
@@ -269,7 +311,7 @@ mod tests {
 
     fn render_to_string(snapshot: &Snapshot) -> String {
         let mut buf = Vec::new();
-        render(snapshot, &mut buf).expect("render");
+        render(snapshot, &mut buf, false).expect("render");
         String::from_utf8(buf).expect("utf8")
     }
 

@@ -54,7 +54,7 @@ fn edge(from: &str, to: &str, ann: Annotation) -> Edge {
 
 fn render_str(snap: &Snapshot) -> String {
     let mut buf = Vec::new();
-    render(snap, &mut buf).expect("render");
+    render(snap, &mut buf, false).expect("render");
     String::from_utf8(buf).expect("utf8")
 }
 

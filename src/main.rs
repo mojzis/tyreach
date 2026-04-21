@@ -100,11 +100,19 @@ enum Command {
         /// Print the rendered text view to stdout instead of writing files.
         #[arg(long = "stdout", default_value_t = false)]
         to_stdout: bool,
+        /// Include noisy builtin call targets (`builtins.print`, `Path`,
+        /// `mkdir`, ...) in the rendered text view. Off by default so the
+        /// `.txt` is easier to scan; the `.toon` is unaffected either way.
+        #[arg(long = "with-builtins", default_value_t = false)]
+        with_builtins: bool,
     },
     /// Render a previously captured TOON snapshot as a topologically-sorted text view.
     Render {
         /// Path to the TOON snapshot to render. Reads stdin when omitted.
         input: Option<PathBuf>,
+        /// Include noisy builtin call targets in the rendered output.
+        #[arg(long = "with-builtins", default_value_t = false)]
+        with_builtins: bool,
     },
     /// Inspect a repo and report which entry-point source (tyreach.toml /
     /// pyproject.toml) is active. Read-only — no snapshot is produced.
@@ -127,10 +135,19 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Snapshot { repo, entries, budget, out, no_render, to_stdout } => {
-            run_snapshot(&repo, &entries, budget, out.as_deref(), no_render, to_stdout).await
+        Command::Snapshot { repo, entries, budget, out, no_render, to_stdout, with_builtins } => {
+            run_snapshot(
+                &repo,
+                &entries,
+                budget,
+                out.as_deref(),
+                no_render,
+                to_stdout,
+                with_builtins,
+            )
+            .await
         }
-        Command::Render { input } => run_render(input.as_deref()),
+        Command::Render { input, with_builtins } => run_render(input.as_deref(), with_builtins),
         Command::Setup { repo } => run_setup(&repo),
     }
 }
@@ -142,6 +159,7 @@ async fn run_snapshot(
     out_prefix: Option<&Path>,
     no_render: bool,
     to_stdout: bool,
+    with_builtins: bool,
 ) -> Result<()> {
     let root = WorkspaceDetector::find_workspace_root(repo).unwrap_or_else(|| repo.to_path_buf());
     tracing::info!("snapshot root: {}", root.display());
@@ -166,7 +184,7 @@ async fn run_snapshot(
     if to_stdout {
         let stdout = io::stdout();
         let mut handle = stdout.lock();
-        render(&snapshot, &mut handle).context("render to stdout")?;
+        render(&snapshot, &mut handle, with_builtins).context("render to stdout")?;
         return Ok(());
     }
 
@@ -177,7 +195,7 @@ async fn run_snapshot(
 
     write_toon_file(&snapshot, &prefix)?;
     if !no_render {
-        write_rendered_file(&snapshot, &prefix)?;
+        write_rendered_file(&snapshot, &prefix, with_builtins)?;
     }
 
     // Structurally-valid but empty snapshots are a silent foot-gun: an agent
@@ -233,11 +251,12 @@ fn entry_qnames(snapshot: &Snapshot) -> Vec<String> {
     v
 }
 
-fn write_rendered_file(snapshot: &Snapshot, prefix: &Path) -> Result<()> {
+fn write_rendered_file(snapshot: &Snapshot, prefix: &Path, with_builtins: bool) -> Result<()> {
     let path = with_extension(prefix, "txt");
     let file = fs::File::create(&path).with_context(|| format!("create {}", path.display()))?;
     let mut writer = BufWriter::new(file);
-    render(snapshot, &mut writer).with_context(|| format!("render {}", path.display()))?;
+    render(snapshot, &mut writer, with_builtins)
+        .with_context(|| format!("render {}", path.display()))?;
     tracing::info!("wrote {}", path.display());
     println!("wrote {}", path.display());
     Ok(())
@@ -482,7 +501,7 @@ fn print_agent_guidance() {
     println!("propose a `tyreach.toml` in your response rather than writing one.");
 }
 
-fn run_render(input: Option<&Path>) -> Result<()> {
+fn run_render(input: Option<&Path>, with_builtins: bool) -> Result<()> {
     let text = if let Some(path) = input {
         fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?
     } else {
@@ -507,7 +526,7 @@ fn run_render(input: Option<&Path>) -> Result<()> {
     rank(&mut snapshot);
     let stdout = io::stdout();
     let mut handle = stdout.lock();
-    render(&snapshot, &mut handle).context("render")?;
+    render(&snapshot, &mut handle, with_builtins).context("render")?;
     Ok(())
 }
 
