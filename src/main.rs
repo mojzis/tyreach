@@ -6,16 +6,61 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use tyreach::budget::fit_to_budget;
-use tyreach::entry::resolve_entries;
+use tyreach::entry::{detect_entries, parse_tyreach_toml, resolve_entries, EntryPoint};
 use tyreach::rank::rank;
 use tyreach::render::render;
 use tyreach::toon_io::{read_snapshot_toon, write_snapshot_toon};
 use tyreach::walker::Snapshot;
 use tyreach::workspace::WorkspaceDetector;
 
-/// `tyreach` — produce ranked, token-budgeted reachability snapshots of a Python project.
+const LONG_ABOUT: &str = "\
+tyreach walks the Python call graph from one or more entry points and emits a \
+ranked, token-budgeted reachability snapshot: a flat `nodes + edges` table in \
+canonical TOON plus a topologically-sorted rendered text view.
+
+It uses tree-sitter for call-site extraction and the `ty` LSP for symbol \
+resolution, scoped to the repo and stopping at site-packages. The output is \
+designed to be dropped into a coding agent's context window before code \
+changes so the agent has call-graph situational awareness.";
+
+const AFTER_LONG_HELP: &str = "\
+Getting started in an unfamiliar repo:
+
+  1. Run `tyreach setup` to see which entry-point source is active.
+  2. If entries are detected, run `tyreach snapshot` — writes
+     <name>.toon and <name>.txt side-by-side.
+  3. If no entries are detected, either pass --entry on the CLI or
+     write a tyreach.toml in the repo root.
+
+Entry-point precedence (highest first):
+
+  1. --entry path/to/file.py::func        (CLI flag, repeatable)
+  2. tyreach.toml                         (repo root)
+  3. pyproject.toml [project.scripts]     (auto-detected)
+
+Minimal tyreach.toml:
+
+  [[entries]]
+  name = \"cli\"
+  entry_file = \"myapp/cli.py\"
+  function = \"main\"   # optional; defaults to \"main\"
+
+Run `tyreach setup` inside a repo to diagnose which source wins and see \
+the resolved file paths.";
+
+const ABOUT: &str = "\
+Ranked, token-budgeted reachability snapshot of a Python project. \
+Run `tyreach --help` for a setup walkthrough or `tyreach setup` to \
+diagnose which entry-point source a repo uses.";
+
 #[derive(Parser, Debug)]
-#[command(name = "tyreach", version, about, long_about = None)]
+#[command(
+    name = "tyreach",
+    version,
+    about = ABOUT,
+    long_about = LONG_ABOUT,
+    after_long_help = AFTER_LONG_HELP,
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -57,6 +102,13 @@ enum Command {
         /// Path to the TOON snapshot to render. Reads stdin when omitted.
         input: Option<PathBuf>,
     },
+    /// Inspect a repo and report which entry-point source (tyreach.toml /
+    /// pyproject.toml) is active. Read-only — no snapshot is produced.
+    Setup {
+        /// Repository root to inspect. Defaults to the current directory.
+        #[arg(value_name = "REPO", default_value = ".")]
+        repo: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -75,6 +127,7 @@ async fn main() -> Result<()> {
             run_snapshot(&repo, &entries, budget, out.as_deref(), no_render, to_stdout).await
         }
         Command::Render { input } => run_render(input.as_deref()),
+        Command::Setup { repo } => run_setup(&repo),
     }
 }
 
@@ -165,6 +218,113 @@ fn with_extension(prefix: &Path, ext: &str) -> PathBuf {
     out.push(".");
     out.push(ext);
     PathBuf::from(out)
+}
+
+fn run_setup(repo: &Path) -> Result<()> {
+    let root = WorkspaceDetector::find_workspace_root(repo).unwrap_or_else(|| repo.to_path_buf());
+
+    println!("repo: {}", repo.display());
+    println!("workspace root: {}", root.display());
+    println!();
+
+    // `setup` deliberately avoids `resolve_entries` because that helper
+    // collapses the "which source won" signal we need to surface here.
+    let from_tyreach =
+        parse_tyreach_toml(&root).context("parse tyreach.toml during setup diagnosis")?;
+    let from_pyproject =
+        detect_entries(&root).context("inspect pyproject.toml during setup diagnosis")?;
+    let pyproject_exists = root.join("pyproject.toml").is_file();
+    let tyreach_toml_exists = root.join("tyreach.toml").is_file();
+
+    // Precedence: --entry > tyreach.toml > pyproject.toml. `setup` has no
+    // notion of --entry (it's a runtime-only flag on `snapshot`), so we
+    // always render that row as "not provided".
+    let tyreach_row = if tyreach_toml_exists {
+        if from_tyreach.is_empty() {
+            "[ ] tyreach.toml            no entries defined".to_owned()
+        } else {
+            format!(
+                "[x] tyreach.toml            {} {}",
+                from_tyreach.len(),
+                pluralize_entries(from_tyreach.len())
+            )
+        }
+    } else {
+        "[ ] tyreach.toml            not found".to_owned()
+    };
+
+    // tyreach.toml, when present with entries, wins over pyproject. Reflect
+    // that in the checkbox rendering (pyproject is "eclipsed" rather than
+    // "active") so the agent sees which source actually drives snapshot.
+    let tyreach_wins = !from_tyreach.is_empty();
+    let pyproject_row = if !pyproject_exists {
+        "[ ] pyproject.toml scripts  file not found".to_owned()
+    } else if from_pyproject.is_empty() {
+        "[ ] pyproject.toml scripts  no [project.scripts] block".to_owned()
+    } else if tyreach_wins {
+        format!(
+            "[ ] pyproject.toml scripts  {} {} (eclipsed by tyreach.toml)",
+            from_pyproject.len(),
+            pluralize_entries(from_pyproject.len())
+        )
+    } else {
+        format!(
+            "[x] pyproject.toml scripts  {} {}",
+            from_pyproject.len(),
+            pluralize_entries(from_pyproject.len())
+        )
+    };
+
+    println!("entry sources (highest precedence first):");
+    println!("  [ ] --entry CLI flag        not provided");
+    println!("  {tyreach_row}");
+    println!("  {pyproject_row}");
+    println!();
+
+    let active: &[EntryPoint] = if tyreach_wins { &from_tyreach } else { &from_pyproject };
+
+    if active.is_empty() {
+        print_empty_skeleton();
+    } else {
+        println!("resolved entries:");
+        for entry in active {
+            println!("  {}", entry.name);
+            println!("    file:     {}", entry.file.display());
+            println!("    function: {}", entry.function);
+        }
+        println!();
+        println!("next: run `tyreach snapshot` from {}", root.display());
+    }
+
+    Ok(())
+}
+
+fn pluralize_entries(count: usize) -> &'static str {
+    if count == 1 {
+        "entry"
+    } else {
+        "entries"
+    }
+}
+
+fn print_empty_skeleton() {
+    println!("no entry points discovered. choose one:");
+    println!();
+    println!("  1) create tyreach.toml:");
+    println!();
+    println!("     [[entries]]");
+    println!("     name = \"cli\"");
+    println!("     entry_file = \"path/to/cli.py\"");
+    println!("     function = \"main\"");
+    println!();
+    println!("  2) pass --entry on the CLI:");
+    println!();
+    println!("     tyreach snapshot --entry path/to/cli.py::main");
+    println!();
+    println!("  3) add [project.scripts] to pyproject.toml:");
+    println!();
+    println!("     [project.scripts]");
+    println!("     mytool = \"mypkg.cli:main\"");
 }
 
 fn run_render(input: Option<&Path>) -> Result<()> {

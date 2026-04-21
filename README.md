@@ -78,6 +78,11 @@ tyreach render myapp.toon
 2. `tyreach.toml` in the repo root.
 3. `[project.scripts]` in `pyproject.toml`.
 
+Not sure which source is active in a given repo? Run `tyreach setup` — a
+read-only diagnostic that prints the workspace root, a status table of the
+three sources, and the resolved entries of whichever one wins. When no source
+yields entries it prints a ready-to-copy `tyreach.toml` skeleton instead.
+
 #### `tyreach.toml` schema
 
 ```toml

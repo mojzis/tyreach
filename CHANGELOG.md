@@ -3,6 +3,11 @@
 All notable changes to `tyreach` are captured here. Dates are ISO-8601; the
 format follows [Keep a Changelog](https://keepachangelog.com/) loosely.
 
+## [Unreleased]
+
+- Added: 'tyreach setup' subcommand — read-only diagnostic that reports which entry-point source (tyreach.toml / pyproject.toml) is active in a repo and prints a ready-to-copy tyreach.toml skeleton when none is found.
+- Changed: enriched 'tyreach --help' with a setup walkthrough so coding agents can bootstrap tyreach in an unfamiliar repo from the help output alone.
+
 ## 0.1.0 — 2026-04-20
 
 First shippable release. What works:

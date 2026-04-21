@@ -209,7 +209,7 @@ pub fn resolve_entries(repo_root: &Path, cli_entries: &[String]) -> Result<Vec<E
     let detected = detect_entries(repo_root).context("detect entries from pyproject.toml")?;
     if detected.is_empty() {
         anyhow::bail!(
-            "no entry points found; supply --entry path/to/file.py::func, create tyreach.toml, or add [project.scripts]"
+            "no entry points found; supply --entry path/to/file.py::func, create tyreach.toml, or add [project.scripts]; run 'tyreach setup' for a diagnosis"
         );
     }
     Ok(detected)
