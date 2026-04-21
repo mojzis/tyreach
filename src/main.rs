@@ -221,16 +221,35 @@ fn with_extension(prefix: &Path, ext: &str) -> PathBuf {
 }
 
 fn run_setup(repo: &Path) -> Result<()> {
-    let root = WorkspaceDetector::find_workspace_root(repo).unwrap_or_else(|| repo.to_path_buf());
+    // Validate the repo path up front. Without this, `setup /typo/path` would
+    // silently produce the empty-case output — indistinguishable from a real
+    // empty repo, which is actively misleading for an agent.
+    if !repo.exists() {
+        anyhow::bail!("repo path does not exist: {}", repo.display());
+    }
+    if !repo.is_dir() {
+        anyhow::bail!("repo path is not a directory: {}", repo.display());
+    }
+
+    let (root, detected_root) = match WorkspaceDetector::find_workspace_root(repo) {
+        Some(r) => (r, true),
+        None => (repo.to_path_buf(), false),
+    };
 
     println!("repo: {}", repo.display());
-    println!("workspace root: {}", root.display());
+    if detected_root {
+        println!("workspace root: {}", root.display());
+    } else {
+        println!("workspace root: {} (no marker found; using repo path as-is)", root.display());
+    }
     println!();
 
     // `setup` deliberately avoids `resolve_entries` because that helper
     // collapses the "which source won" signal we need to surface here.
-    let from_tyreach =
-        parse_tyreach_toml(&root).context("parse tyreach.toml during setup diagnosis")?;
+    // A malformed tyreach.toml is reported as a row, not a fatal error —
+    // `setup` exists precisely to diagnose broken configs, so it must still
+    // render the rest of the table when one source is misconfigured.
+    let tyreach_result = parse_tyreach_toml(&root);
     let from_pyproject =
         detect_entries(&root).context("inspect pyproject.toml during setup diagnosis")?;
     let pyproject_exists = root.join("pyproject.toml").is_file();
@@ -238,25 +257,24 @@ fn run_setup(repo: &Path) -> Result<()> {
 
     // Precedence: --entry > tyreach.toml > pyproject.toml. `setup` has no
     // notion of --entry (it's a runtime-only flag on `snapshot`), so we
-    // always render that row as "not provided".
-    let tyreach_row = if tyreach_toml_exists {
-        if from_tyreach.is_empty() {
+    // always render that row as "snapshot only".
+    let tyreach_row = match &tyreach_result {
+        Err(err) => format!("[!] tyreach.toml            malformed: {err:#}"),
+        Ok(entries) if entries.is_empty() && tyreach_toml_exists => {
             "[ ] tyreach.toml            no entries defined".to_owned()
-        } else {
-            format!(
-                "[x] tyreach.toml            {} {}",
-                from_tyreach.len(),
-                pluralize_entries(from_tyreach.len())
-            )
         }
-    } else {
-        "[ ] tyreach.toml            not found".to_owned()
+        Ok(entries) if entries.is_empty() => "[ ] tyreach.toml            not found".to_owned(),
+        Ok(entries) => format!(
+            "[x] tyreach.toml            {} {}",
+            entries.len(),
+            pluralize_entries(entries.len())
+        ),
     };
 
     // tyreach.toml, when present with entries, wins over pyproject. Reflect
     // that in the checkbox rendering (pyproject is "eclipsed" rather than
     // "active") so the agent sees which source actually drives snapshot.
-    let tyreach_wins = !from_tyreach.is_empty();
+    let tyreach_wins = tyreach_result.as_ref().is_ok_and(|v| !v.is_empty());
     let pyproject_row = if !pyproject_exists {
         "[ ] pyproject.toml scripts  file not found".to_owned()
     } else if from_pyproject.is_empty() {
@@ -276,12 +294,13 @@ fn run_setup(repo: &Path) -> Result<()> {
     };
 
     println!("entry sources (highest precedence first):");
-    println!("  [ ] --entry CLI flag        not provided");
+    println!("  [ ] --entry CLI flag        snapshot only");
     println!("  {tyreach_row}");
     println!("  {pyproject_row}");
     println!();
 
-    let active: &[EntryPoint] = if tyreach_wins { &from_tyreach } else { &from_pyproject };
+    let from_tyreach_slice: &[EntryPoint] = tyreach_result.as_deref().unwrap_or(&[]);
+    let active: &[EntryPoint] = if tyreach_wins { from_tyreach_slice } else { &from_pyproject };
 
     if active.is_empty() {
         print_empty_skeleton();
@@ -381,4 +400,17 @@ fn reconstruct_depths(
         }
     }
     depth
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pluralize_entries;
+
+    #[test]
+    fn pluralize_entries_uses_singular_only_for_one() {
+        assert_eq!(pluralize_entries(0), "entries");
+        assert_eq!(pluralize_entries(1), "entry");
+        assert_eq!(pluralize_entries(2), "entries");
+        assert_eq!(pluralize_entries(42), "entries");
+    }
 }

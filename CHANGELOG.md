@@ -5,7 +5,7 @@ format follows [Keep a Changelog](https://keepachangelog.com/) loosely.
 
 ## [Unreleased]
 
-- Added: 'tyreach setup' subcommand — read-only diagnostic that reports which entry-point source (tyreach.toml / pyproject.toml) is active in a repo and prints a ready-to-copy tyreach.toml skeleton when none is found.
+- Added: 'tyreach setup' subcommand — read-only diagnostic that reports which entry-point source (tyreach.toml / pyproject.toml) is active in a repo and prints a ready-to-copy tyreach.toml skeleton when none is found. Errors when the repo path does not exist or is not a directory (so a typo is not silently indistinguishable from an empty repo), and renders a malformed tyreach.toml as a diagnostic row rather than aborting.
 - Changed: enriched 'tyreach --help' with a setup walkthrough so coding agents can bootstrap tyreach in an unfamiliar repo from the help output alone.
 
 ## 0.1.0 — 2026-04-20
