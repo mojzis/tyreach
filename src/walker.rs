@@ -144,7 +144,13 @@ impl<'a> Walker<'a> {
                         let (nl, nc) = function_name_position(&fn_node).unwrap_or((0, 0));
                         let doc = first_docstring_line(&fn_node, &parsed.source);
                         let row = u32::try_from(fn_node.start_position().row).unwrap_or(0);
-                        let call_sites = extract_call_sites(parsed, item.byte_range.clone());
+                        // Scope call-site extraction to the function body so
+                        // parameter defaults (e.g. `typer.Option(...)`) are
+                        // not picked up as outgoing edges.
+                        let body_range = fn_node
+                            .child_by_field_name("body")
+                            .map_or_else(|| item.byte_range.clone(), |b| b.byte_range());
+                        let call_sites = extract_call_sites(parsed, body_range);
                         (nl, nc, doc, row, call_sites, true)
                     },
                 )

@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use tyreach::extract::extract_call_sites;
-use tyreach::parse::parse_file;
+use tyreach::parse::{parse_bytes, parse_file, ParsedFile};
 
 #[test]
 fn main_function_call_sites_include_foo_and_get() {
@@ -44,4 +44,50 @@ fn main_function_call_sites_include_foo_and_get() {
             source_lines
         );
     }
+}
+
+/// Regression: walker-side callers must scope `extract_call_sites` to the
+/// function body, so Typer-style parameter defaults like `typer.Option(...)`
+/// are not picked up as outgoing call sites. This test feeds the body-only
+/// byte range (mirroring the walker) and asserts `Option` is absent while the
+/// real body call `print` is present.
+#[test]
+fn parameter_default_calls_are_not_extracted_from_body() {
+    let source = br#"import typer
+
+def cmd(
+    x: str = typer.Option("", help="..."),
+    y: int = typer.Argument(0),
+):
+    """Body."""
+    print(x)
+"#
+    .to_vec();
+    let parsed: ParsedFile = parse_bytes(source, PathBuf::from("fixture.py")).expect("parse");
+
+    let root = parsed.tree.root_node();
+    let mut cursor = root.walk();
+    let fn_node = root
+        .children(&mut cursor)
+        .find(|n| {
+            n.kind() == "function_definition"
+                && n.child_by_field_name("name")
+                    .and_then(|name| name.utf8_text(&parsed.source).ok())
+                    == Some("cmd")
+        })
+        .expect("cmd function_definition");
+
+    let body = fn_node.child_by_field_name("body").expect("function has a body");
+    let sites = extract_call_sites(&parsed, body.byte_range());
+
+    let callees: Vec<_> = sites.iter().map(|s| s.callee_text.as_str()).collect();
+    assert!(callees.contains(&"print"), "body scope should include print, got {callees:?}");
+    assert!(
+        !callees.contains(&"Option"),
+        "parameter-default typer.Option must NOT be extracted, got {callees:?}"
+    );
+    assert!(
+        !callees.contains(&"Argument"),
+        "parameter-default typer.Argument must NOT be extracted, got {callees:?}"
+    );
 }
