@@ -6,7 +6,9 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use tyreach::budget::{fit_to_budget, scale_budget, PER_ENTRY_BUDGET_FLOOR};
-use tyreach::entry::{detect_entries, parse_tyreach_toml, resolve_entries, EntryPoint};
+use tyreach::entry::{
+    detect_entries, detect_init_entries, parse_tyreach_toml, resolve_entries, EntryPoint,
+};
 use tyreach::rank::rank;
 use tyreach::render::render;
 use tyreach::toon_io::{read_snapshot_toon, write_snapshot_toon};
@@ -37,6 +39,7 @@ Entry-point precedence (highest first):
   1. --entry path/to/file.py::func        (CLI flag, repeatable)
   2. tyreach.toml                         (repo root)
   3. pyproject.toml [project.scripts]     (auto-detected)
+  4. <pkg>/__init__.py exports            (auto-detected, library fallback)
 
 Minimal tyreach.toml:
 
@@ -250,6 +253,67 @@ fn with_extension(prefix: &Path, ext: &str) -> PathBuf {
     PathBuf::from(out)
 }
 
+fn tyreach_source_row(
+    tyreach_result: &Result<Vec<EntryPoint>>,
+    tyreach_toml_exists: bool,
+) -> String {
+    match tyreach_result {
+        Err(err) => format!("[!] tyreach.toml            malformed: {err:#}"),
+        Ok(entries) if entries.is_empty() && tyreach_toml_exists => {
+            "[ ] tyreach.toml            no entries defined".to_owned()
+        }
+        Ok(entries) if entries.is_empty() => "[ ] tyreach.toml            not found".to_owned(),
+        Ok(entries) => format!(
+            "[x] tyreach.toml            {} {}",
+            entries.len(),
+            pluralize_entries(entries.len())
+        ),
+    }
+}
+
+fn pyproject_source_row(
+    from_pyproject: &[EntryPoint],
+    pyproject_exists: bool,
+    tyreach_wins: bool,
+) -> String {
+    if !pyproject_exists {
+        "[ ] pyproject.toml scripts  file not found".to_owned()
+    } else if from_pyproject.is_empty() {
+        "[ ] pyproject.toml scripts  no [project.scripts] block".to_owned()
+    } else if tyreach_wins {
+        format!(
+            "[ ] pyproject.toml scripts  {} {} (eclipsed by tyreach.toml)",
+            from_pyproject.len(),
+            pluralize_entries(from_pyproject.len())
+        )
+    } else {
+        format!(
+            "[x] pyproject.toml scripts  {} {}",
+            from_pyproject.len(),
+            pluralize_entries(from_pyproject.len())
+        )
+    }
+}
+
+fn init_source_row(from_init: &[EntryPoint], init_wins: bool, tyreach_wins: bool) -> String {
+    if from_init.is_empty() {
+        "[ ] __init__.py exports     no top-level packages with exports".to_owned()
+    } else if init_wins {
+        format!(
+            "[x] __init__.py exports     {} {}",
+            from_init.len(),
+            pluralize_entries(from_init.len())
+        )
+    } else {
+        let eclipser = if tyreach_wins { "tyreach.toml" } else { "pyproject.toml" };
+        format!(
+            "[ ] __init__.py exports     {} {} (eclipsed by {eclipser})",
+            from_init.len(),
+            pluralize_entries(from_init.len())
+        )
+    }
+}
+
 fn run_setup(repo: &Path) -> Result<()> {
     // Validate the repo path up front. Without this, `setup /typo/path` would
     // silently produce the empty-case output — indistinguishable from a real
@@ -282,55 +346,39 @@ fn run_setup(repo: &Path) -> Result<()> {
     let tyreach_result = parse_tyreach_toml(&root);
     let from_pyproject =
         detect_entries(&root).context("inspect pyproject.toml during setup diagnosis")?;
+    let from_init =
+        detect_init_entries(&root).context("inspect __init__.py exports during setup diagnosis")?;
     let pyproject_exists = root.join("pyproject.toml").is_file();
     let tyreach_toml_exists = root.join("tyreach.toml").is_file();
 
-    // Precedence: --entry > tyreach.toml > pyproject.toml. `setup` has no
-    // notion of --entry (it's a runtime-only flag on `snapshot`), so we
-    // always render that row as "snapshot only".
-    let tyreach_row = match &tyreach_result {
-        Err(err) => format!("[!] tyreach.toml            malformed: {err:#}"),
-        Ok(entries) if entries.is_empty() && tyreach_toml_exists => {
-            "[ ] tyreach.toml            no entries defined".to_owned()
-        }
-        Ok(entries) if entries.is_empty() => "[ ] tyreach.toml            not found".to_owned(),
-        Ok(entries) => format!(
-            "[x] tyreach.toml            {} {}",
-            entries.len(),
-            pluralize_entries(entries.len())
-        ),
-    };
-
-    // tyreach.toml, when present with entries, wins over pyproject. Reflect
-    // that in the checkbox rendering (pyproject is "eclipsed" rather than
-    // "active") so the agent sees which source actually drives snapshot.
+    // Precedence: --entry > tyreach.toml > pyproject.toml > __init__.py.
+    // `setup` has no notion of --entry (it's a runtime-only flag on `snapshot`),
+    // so we always render that row as "snapshot only".
     let tyreach_wins = tyreach_result.as_ref().is_ok_and(|v| !v.is_empty());
-    let pyproject_row = if !pyproject_exists {
-        "[ ] pyproject.toml scripts  file not found".to_owned()
-    } else if from_pyproject.is_empty() {
-        "[ ] pyproject.toml scripts  no [project.scripts] block".to_owned()
-    } else if tyreach_wins {
-        format!(
-            "[ ] pyproject.toml scripts  {} {} (eclipsed by tyreach.toml)",
-            from_pyproject.len(),
-            pluralize_entries(from_pyproject.len())
-        )
-    } else {
-        format!(
-            "[x] pyproject.toml scripts  {} {}",
-            from_pyproject.len(),
-            pluralize_entries(from_pyproject.len())
-        )
-    };
+    let pyproject_wins = !tyreach_wins && !from_pyproject.is_empty();
+    let init_wins = !tyreach_wins && !pyproject_wins && !from_init.is_empty();
+
+    let tyreach_row = tyreach_source_row(&tyreach_result, tyreach_toml_exists);
+    let pyproject_row = pyproject_source_row(&from_pyproject, pyproject_exists, tyreach_wins);
+    let init_row = init_source_row(&from_init, init_wins, tyreach_wins);
 
     println!("entry sources (highest precedence first):");
     println!("  [ ] --entry CLI flag        snapshot only");
     println!("  {tyreach_row}");
     println!("  {pyproject_row}");
+    println!("  {init_row}");
     println!();
 
     let from_tyreach_slice: &[EntryPoint] = tyreach_result.as_deref().unwrap_or(&[]);
-    let active: &[EntryPoint] = if tyreach_wins { from_tyreach_slice } else { &from_pyproject };
+    let active: &[EntryPoint] = if tyreach_wins {
+        from_tyreach_slice
+    } else if pyproject_wins {
+        &from_pyproject
+    } else if init_wins {
+        &from_init
+    } else {
+        &[]
+    };
 
     if active.is_empty() {
         print_empty_skeleton();
@@ -400,6 +448,11 @@ fn print_empty_skeleton() {
     println!();
     println!("     [project.scripts]");
     println!("     mytool = \"mypkg.cli:main\"");
+    println!();
+    println!("  4) export names from <pkg>/__init__.py (library fallback):");
+    println!();
+    println!("     # <pkg>/__init__.py");
+    println!("     __all__ = [\"run\", \"Thing\"]");
     println!();
     println!(
         "Once entries are configured, run `tyreach setup` again — it will \

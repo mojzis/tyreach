@@ -1,6 +1,6 @@
 //! Entry-point discovery.
 //!
-//! Three sources, in precedence order (highest first):
+//! Four sources, in precedence order (highest first):
 //!
 //! 1. `--entry` CLI flag — parsed via [`parse_cli_entry`]. Accepts
 //!    `path/to/file.py::func`. The `::func` suffix is mandatory for v1. Paths
@@ -14,17 +14,35 @@
 //!    We resolve the module portion to a `.py` file on disk by trying, in
 //!    order: `{root}/{path}.py`, `{root}/src/{path}.py`,
 //!    `{root}/{path}/__init__.py`, `{root}/src/{path}/__init__.py`.
+//! 4. `__init__.py` exports — auto-detected via [`detect_init_entries`] for
+//!    libraries that publish an API without a CLI. Top-level packages (directly
+//!    under `repo_root` or `repo_root/src`) are scanned; exports come from
+//!    `__all__`, else top-level `def`/`class`, else `from .submod import X`
+//!    re-exports. Capped at 20 per discovery.
 //!
 //! The [`resolve_entries`] helper implements the precedence: CLI wins if
-//! non-empty; else `tyreach.toml` wins if present; else auto-detect
-//! `pyproject.toml`.
+//! non-empty; else `tyreach.toml`; else `pyproject.toml` scripts; else
+//! `__init__.py` exports.
 //!
 //! Dockerfile entry-point parsing is deferred to v1.1.
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
+use tree_sitter::StreamingIterator;
+
+use crate::parse::{parse_file, ParsedFile};
+
+/// Cap on number of entries a single `detect_init_entries` call emits.
+///
+/// Libraries occasionally re-export dozens of names; the walker is fine with
+/// that but the downstream token budget isn't, and a ranked view across 50
+/// entries is rarely more useful than across 20. Keeping the first 20 in
+/// source order matches the convention authors use when they curate `__all__`
+/// themselves.
+const INIT_ENTRY_CAP: usize = 20;
 
 /// A single callable entry point: function `function` defined in `file`,
 /// identified by `name` (typically the script name or CLI string).
@@ -82,6 +100,281 @@ pub fn detect_entries(repo_root: &Path) -> Result<Vec<EntryPoint>> {
     }
 
     Ok(out)
+}
+
+/// Auto-detect entries from top-level packages' `__init__.py` exports.
+///
+/// Fallback for library repos with no CLI and no `[project.scripts]`. Scans
+/// directories directly under `repo_root` (and under `repo_root/src`) that
+/// contain an `__init__.py`, then enumerates exports in priority order:
+///
+/// 1. `__all__ = [...]` string literals.
+/// 2. Top-level `def`/`class` whose name does not start with `_`.
+/// 3. `from .<submod> import <name> [as <alias>]` — the (aliased) name.
+///
+/// Deduplicated by export name, capped at 20 entries per discovery. When
+/// multiple packages contribute, their exports are unioned and re-capped.
+///
+/// Missing files, unreadable packages, and malformed Python are never fatal —
+/// they drop out of the result and the caller falls through to the
+/// "no entries" error path.
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "Result keeps the signature in lock-step with detect_entries and parse_tyreach_toml so callers can use .context() uniformly and we can surface I/O errors in a later iteration without a breaking change."
+)]
+pub fn detect_init_entries(repo_root: &Path) -> Result<Vec<EntryPoint>> {
+    let mut out = Vec::new();
+
+    for init_path in candidate_init_files(repo_root) {
+        let parsed = match parse_file(&init_path) {
+            Ok(p) => p,
+            Err(err) => {
+                tracing::warn!(
+                    "detect_init_entries: could not parse {}: {err:#}",
+                    init_path.display()
+                );
+                continue;
+            }
+        };
+
+        let exports = enumerate_package_exports(&parsed, &init_path);
+        for name in exports {
+            out.push(EntryPoint { name: name.clone(), file: init_path.clone(), function: name });
+        }
+    }
+
+    // Union-dedup across packages, preserving first occurrence.
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|e| seen.insert(e.name.clone()));
+
+    if out.len() > INIT_ENTRY_CAP {
+        tracing::warn!(
+            "detect_init_entries: discovered {} exports across packages; capping at {}",
+            out.len(),
+            INIT_ENTRY_CAP
+        );
+        out.truncate(INIT_ENTRY_CAP);
+    }
+
+    Ok(out)
+}
+
+/// Find `__init__.py` files of top-level packages under `repo_root`.
+///
+/// Looks one level deep in `repo_root` and in `repo_root/src`. Nested
+/// subpackages are intentionally ignored — a library's top-level package API
+/// is almost always what users import, and scanning deeper blows up the
+/// entry count on monorepos without making the snapshot more useful.
+fn candidate_init_files(repo_root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for base in [repo_root.to_path_buf(), repo_root.join("src")] {
+        let Ok(entries) = std::fs::read_dir(&base) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let init = path.join("__init__.py");
+            if init.is_file() {
+                out.push(init);
+            }
+        }
+    }
+    // Stable order across platforms; `read_dir` does not guarantee one.
+    out.sort();
+    out
+}
+
+/// Pull the public-export list out of a single parsed `__init__.py`.
+///
+/// Priority is strict: if `__all__` is defined, nothing else contributes; only
+/// if it's absent do `def`/`class` and `from .x import y` contribute. This
+/// mirrors Python's own rule for `from pkg import *`.
+fn enumerate_package_exports(parsed: &ParsedFile, init_path: &Path) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let root = parsed.tree.root_node();
+
+    let all_names = extract_all_list(parsed);
+    if let Some(all_list) = all_names {
+        for name in all_list {
+            if seen.insert(name.clone()) {
+                names.push(name);
+            }
+        }
+    } else {
+        // Module-level def/class — only walk direct children of the module.
+        let mut cursor = root.walk();
+        for child in root.children(&mut cursor) {
+            let Some(export) = top_level_def_or_class_name(&child, &parsed.source) else {
+                continue;
+            };
+            if export.starts_with('_') {
+                continue;
+            }
+            if seen.insert(export.clone()) {
+                names.push(export);
+            }
+        }
+
+        // `from .submod import X [as Y]` — relative imports only.
+        let mut cursor = root.walk();
+        for child in root.children(&mut cursor) {
+            if child.kind() != "import_from_statement" {
+                continue;
+            }
+            if !import_from_is_relative(&child, &parsed.source) {
+                continue;
+            }
+            for imported in import_from_names(&child, &parsed.source) {
+                if imported.starts_with('_') {
+                    continue;
+                }
+                if seen.insert(imported.clone()) {
+                    names.push(imported);
+                }
+            }
+        }
+    }
+
+    if names.len() > INIT_ENTRY_CAP {
+        tracing::warn!(
+            "detect_init_entries: {} exports in {}; capping at {}",
+            names.len(),
+            init_path.display(),
+            INIT_ENTRY_CAP
+        );
+        names.truncate(INIT_ENTRY_CAP);
+    }
+
+    names
+}
+
+/// Parse `__all__ = [...]` into the list of string literals, if present.
+///
+/// Returns `None` when `__all__` is absent so callers can fall through to the
+/// `def`/`class` path. Non-list right-hand sides (e.g. tuples, computed
+/// values) are treated as "present but empty" — we prefer that over quietly
+/// falling through, since authors who set `__all__` almost always mean it.
+fn extract_all_list(parsed: &ParsedFile) -> Option<Vec<String>> {
+    let query = all_assignment_query(&parsed.tree);
+    let name_idx = query.capture_index_for_name("name")?;
+    let right_idx = query.capture_index_for_name("right")?;
+
+    let mut cursor = tree_sitter::QueryCursor::new();
+    let mut matches = cursor.matches(query, parsed.tree.root_node(), parsed.source.as_slice());
+
+    while let Some(m) = matches.next() {
+        let Some(name_node) = m.captures.iter().find(|c| c.index == name_idx).map(|c| c.node)
+        else {
+            continue;
+        };
+        let Some(right_node) = m.captures.iter().find(|c| c.index == right_idx).map(|c| c.node)
+        else {
+            continue;
+        };
+        if name_node.utf8_text(&parsed.source).ok() != Some("__all__") {
+            continue;
+        }
+
+        if right_node.kind() != "list" {
+            // __all__ = (...)/{...}/some_var — found but not a plain list.
+            // We treat this as "explicitly defined, we can't read it" and stop.
+            return Some(Vec::new());
+        }
+
+        let mut out = Vec::new();
+        let mut inner = right_node.walk();
+        for item in right_node.children(&mut inner) {
+            if item.kind() != "string" {
+                continue;
+            }
+            out.push(string_literal_value(&item, &parsed.source));
+        }
+        return Some(out);
+    }
+
+    None
+}
+
+/// Extract the textual value of a Python string literal node.
+///
+/// tree-sitter represents `"foo"` as a `string` with a `string_start`,
+/// `string_content`, and `string_end`. We concatenate the `string_content`
+/// children rather than slicing the outer node so quote characters and
+/// f-string/b-string prefixes don't leak into the result. An empty string
+/// `""` has no `string_content` child but returning `""` lets the caller's
+/// `_`-prefix filter drop it uniformly with explicitly-named hidden exports.
+fn string_literal_value(node: &tree_sitter::Node<'_>, source: &[u8]) -> String {
+    let mut cursor = node.walk();
+    let mut out = String::new();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "string_content" {
+            if let Ok(text) = child.utf8_text(source) {
+                out.push_str(text);
+            }
+        }
+    }
+    out
+}
+
+/// If `node` is a top-level `function_definition` or `class_definition`,
+/// return the declared name.
+fn top_level_def_or_class_name(node: &tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+    match node.kind() {
+        "function_definition" | "class_definition" => {
+            let name = node.child_by_field_name("name")?;
+            name.utf8_text(source).ok().map(str::to_owned)
+        }
+        _ => None,
+    }
+}
+
+/// Is `import_from_statement` a relative import (`from .x import y`)?
+///
+/// tree-sitter encodes the `from` target as the `module_name` field, which is
+/// either a `dotted_name` (absolute) or a `relative_import` (contains an
+/// `import_prefix` like `.` or `..`).
+fn import_from_is_relative(node: &tree_sitter::Node<'_>, _source: &[u8]) -> bool {
+    let Some(module) = node.child_by_field_name("module_name") else {
+        // `from . import submod` has no module_name field — still relative.
+        // Detect by scanning children for an `import_prefix`.
+        let mut cursor = node.walk();
+        return node
+            .children(&mut cursor)
+            .any(|c| c.kind() == "import_prefix" || c.kind() == "relative_import");
+    };
+    module.kind() == "relative_import"
+}
+
+/// Collect the imported (aliased) names from a `from X import a, b as c`.
+fn import_from_names(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.children_by_field_name("name", &mut cursor) {
+        match child.kind() {
+            "dotted_name" => {
+                if let Ok(text) = child.utf8_text(source) {
+                    out.push(text.to_owned());
+                }
+            }
+            "aliased_import" => {
+                if let Some(alias) = child.child_by_field_name("alias") {
+                    if let Ok(text) = alias.utf8_text(source) {
+                        out.push(text.to_owned());
+                    }
+                } else if let Some(name) = child.child_by_field_name("name") {
+                    if let Ok(text) = name.utf8_text(source) {
+                        out.push(text.to_owned());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 fn resolve_script_spec(repo_root: &Path, spec: &str) -> Option<(PathBuf, String)> {
@@ -193,8 +486,9 @@ pub fn parse_tyreach_toml(repo_root: &Path) -> Result<Vec<EntryPoint>> {
 /// 1. `cli_entries` (parsed with [`parse_cli_entry`]).
 /// 2. `tyreach.toml` (parsed with [`parse_tyreach_toml`]).
 /// 3. `pyproject.toml` `[project.scripts]` (parsed with [`detect_entries`]).
+/// 4. `__init__.py` exports (parsed with [`detect_init_entries`]).
 ///
-/// Errors if *all three* sources yield zero entries — callers usually want to
+/// Errors if *all four* sources yield zero entries — callers usually want to
 /// tell the user to supply `--entry` or populate one of the config files.
 pub fn resolve_entries(repo_root: &Path, cli_entries: &[String]) -> Result<Vec<EntryPoint>> {
     if !cli_entries.is_empty() {
@@ -207,12 +501,18 @@ pub fn resolve_entries(repo_root: &Path, cli_entries: &[String]) -> Result<Vec<E
     }
 
     let detected = detect_entries(repo_root).context("detect entries from pyproject.toml")?;
-    if detected.is_empty() {
+    if !detected.is_empty() {
+        return Ok(detected);
+    }
+
+    let init_entries =
+        detect_init_entries(repo_root).context("detect entries from __init__.py exports")?;
+    if init_entries.is_empty() {
         anyhow::bail!(
-            "no entry points found; supply --entry path/to/file.py::func, create tyreach.toml, or add [project.scripts]; run 'tyreach setup' for a diagnosis"
+            "no entry points found; supply --entry path/to/file.py::func, create tyreach.toml, add [project.scripts], or export names from <pkg>/__init__.py; run 'tyreach setup' for a diagnosis"
         );
     }
-    Ok(detected)
+    Ok(init_entries)
 }
 
 #[derive(Debug, Deserialize)]
@@ -225,6 +525,29 @@ struct TyreachEntry {
     name: String,
     entry_file: String,
     function: Option<String>,
+}
+
+/// Tree-sitter query matching `<name> = <right>` module-level assignments.
+///
+/// Callers filter by `@name`'s text to pick out `__all__`. We reuse the same
+/// compiled query across calls via `OnceLock`, mirroring `src/extract.rs`.
+#[allow(clippy::expect_used, reason = "hard-coded tree-sitter query is known-valid")]
+fn all_assignment_query(tree: &tree_sitter::Tree) -> &'static tree_sitter::Query {
+    static QUERY: OnceLock<tree_sitter::Query> = OnceLock::new();
+    QUERY.get_or_init(|| {
+        let language = tree.language();
+        tree_sitter::Query::new(
+            &language,
+            r"
+            (module
+              (expression_statement
+                (assignment
+                  left: (identifier) @name
+                  right: (_) @right)))
+            ",
+        )
+        .expect("__all__ assignment query must compile")
+    })
 }
 
 /// 1-based (line, column) from a byte offset into `src`.
