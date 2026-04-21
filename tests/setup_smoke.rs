@@ -187,6 +187,20 @@ fn setup_prints_skeleton_when_empty() {
         stdout.contains("CLAUDE.md snippet"),
         "empty case should still mention CLAUDE.md as a forward pointer:\n{stdout}"
     );
+    // Agent-oriented guidance block: a coding agent running `setup` on an
+    // empty repo needs a prescriptive procedure, not just a human menu.
+    assert!(
+        stdout.contains("If you are a coding agent running this"),
+        "expected agent guidance preamble in empty-case output:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("<pkg>/__main__.py"),
+        "expected agent guidance to list obvious entry files:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("propose a `tyreach.toml` in your response rather than writing one"),
+        "expected agent guidance to forbid unprompted repo writes:\n{stdout}"
+    );
 }
 
 #[test]

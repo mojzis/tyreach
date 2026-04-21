@@ -377,6 +377,27 @@ fn print_empty_skeleton() {
          print a ready-to-paste CLAUDE.md snippet tailored to your entry \
          filename."
     );
+    println!();
+    print_agent_guidance();
+}
+
+/// Agent-oriented entry-picking procedure. Printed after the human-facing
+/// three options when no entries are discovered. A coding agent invoking
+/// `tyreach setup` needs a prescriptive procedure rather than a menu.
+fn print_agent_guidance() {
+    println!("If you are a coding agent running this: the repo has no discoverable");
+    println!("entry points. Pick one by:");
+    println!();
+    println!("  1) Looking for a `def main` (or any function called from a shell script");
+    println!("     or Makefile) in the obvious files: `<pkg>/__main__.py`,");
+    println!("     `<pkg>/cli.py`, `src/<pkg>/main.py`, top-level scripts.");
+    println!("  2) For libraries with no CLI, picking the top-level public function");
+    println!("     most users would call (often in `<pkg>/__init__.py`).");
+    println!("  3) Running `tyreach snapshot --entry <file>::<func>`. If the resulting");
+    println!("     `.txt` has fewer than ~5 intra-repo edges, try a different entry.");
+    println!();
+    println!("Do not modify the repo without asking the user. If you find good entries,");
+    println!("propose a `tyreach.toml` in your response rather than writing one.");
 }
 
 fn run_render(input: Option<&Path>) -> Result<()> {
