@@ -8,6 +8,11 @@
 //! * Absent `__all__` → `from .submod import X` re-exports.
 //! * Empty `__init__.py` → zero entries, not an error.
 //!
+//! The resolved `EntryPoint.file` must point at the file that actually
+//! defines `def <name>` / `class <name>`, not the `__init__.py` facade —
+//! otherwise the walker's name-based entry-point lookup fails and the
+//! snapshot comes back empty.
+//!
 //! Tests also confirm precedence: `resolve_entries` only falls through to
 //! `detect_init_entries` when CLI, tyreach.toml, and pyproject scripts all
 //! produce nothing.
@@ -28,6 +33,8 @@ fn write(path: &Path, body: &str) {
 
 #[test]
 fn fixture_1_dunder_all_wins_and_excludes_underscore() {
+    // `__all__` names whose bodies are defined directly in __init__.py —
+    // file must remain the __init__.py facade (rule 1 of the resolution).
     let dir = tempfile::tempdir().expect("tempdir");
     let pkg = dir.path().join("mylib");
     write(
@@ -52,7 +59,7 @@ def _hidden():
         assert_eq!(e.function, e.name, "function must mirror the export name");
         assert!(
             e.file.ends_with("mylib/__init__.py") || e.file.ends_with("mylib\\__init__.py"),
-            "entry file must point at the package __init__.py, got {}",
+            "entry file must point at the package __init__.py when the body defines it, got {}",
             e.file.display()
         );
     }
@@ -82,6 +89,9 @@ def _helper():
 
 #[test]
 fn fixture_3_relative_reexport_when_no_dunder_all() {
+    // Re-export must resolve `file` to submod.py — pointing it at __init__.py
+    // would make the walker's name-based entry lookup miss and produce an
+    // empty snapshot.
     let dir = tempfile::tempdir().expect("tempdir");
     let pkg = dir.path().join("mylib");
     write(&pkg.join("submod.py"), "def X():\n    pass\n");
@@ -92,8 +102,55 @@ fn fixture_3_relative_reexport_when_no_dunder_all() {
     );
 
     let entries = detect_init_entries(dir.path()).expect("detect");
-    let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
-    assert_eq!(names, vec!["X"], "single relative re-export must surface as one entry");
+    assert_eq!(entries.len(), 1, "single relative re-export must surface as one entry");
+    assert_eq!(entries[0].name, "X");
+    assert_eq!(entries[0].function, "X");
+    assert!(
+        entries[0].file.ends_with("mylib/submod.py")
+            || entries[0].file.ends_with("mylib\\submod.py"),
+        "re-exported entry must point at submod.py (not __init__.py); got {}",
+        entries[0].file.display()
+    );
+}
+
+#[test]
+fn dunder_all_with_reexports_resolves_file_to_submod() {
+    // `__all__` names whose bodies live in `submod.py` — rule 2. This is the
+    // shape of nolegend's __init__.py (pure re-export facade) that triggered
+    // the Phase 2 check failure.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pkg = dir.path().join("mylib");
+    write(&pkg.join("template.py"), "def with_palette():\n    pass\n");
+    write(&pkg.join("colors.py"), "def get_palette():\n    pass\n");
+    write(
+        &pkg.join("__init__.py"),
+        r#"__all__ = ["with_palette", "get_palette"]
+
+from .template import with_palette
+from .colors import get_palette
+"#,
+    );
+
+    let entries = detect_init_entries(dir.path()).expect("detect");
+    assert_eq!(entries.len(), 2);
+
+    let with_palette = entries.iter().find(|e| e.name == "with_palette").expect("with_palette");
+    assert_eq!(with_palette.function, "with_palette");
+    assert!(
+        with_palette.file.ends_with("mylib/template.py")
+            || with_palette.file.ends_with("mylib\\template.py"),
+        "with_palette must point at template.py, got {}",
+        with_palette.file.display()
+    );
+
+    let get_palette = entries.iter().find(|e| e.name == "get_palette").expect("get_palette");
+    assert_eq!(get_palette.function, "get_palette");
+    assert!(
+        get_palette.file.ends_with("mylib/colors.py")
+            || get_palette.file.ends_with("mylib\\colors.py"),
+        "get_palette must point at colors.py, got {}",
+        get_palette.file.display()
+    );
 }
 
 #[test]
@@ -107,16 +164,90 @@ fn fixture_4_empty_init_yields_zero_entries() {
 }
 
 #[test]
-fn aliased_reexport_uses_alias_name() {
-    // `from .m import X as Y` — Y is the public name per PEP 8 conventions.
+fn aliased_reexport_uses_alias_name_and_original_function() {
+    // `from .m import X as Y` — Y is the public name (what callers import),
+    // but the function definition in submod.py is still `X`. The walker
+    // must look up `X`, not `Y`, in submod.py.
     let dir = tempfile::tempdir().expect("tempdir");
     let pkg = dir.path().join("mylib");
     write(&pkg.join("submod.py"), "def X():\n    pass\n");
     write(&pkg.join("__init__.py"), "from .submod import X as Y\n");
 
     let entries = detect_init_entries(dir.path()).expect("detect");
-    let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
-    assert_eq!(names, vec!["Y"], "aliased re-export must surface as the alias");
+    assert_eq!(entries.len(), 1, "aliased re-export must surface as exactly one entry");
+    assert_eq!(entries[0].name, "Y", "alias is the public-facing name");
+    assert_eq!(entries[0].function, "X", "function is the original name in submod.py");
+    assert!(
+        entries[0].file.ends_with("mylib/submod.py")
+            || entries[0].file.ends_with("mylib\\submod.py"),
+        "aliased re-export must resolve to submod.py, got {}",
+        entries[0].file.display()
+    );
+}
+
+#[test]
+fn dunder_all_with_unresolvable_name_drops_entry() {
+    // `__all__` lists a name that is neither defined nor imported — the
+    // walker has no file to search in, so the entry must be dropped rather
+    // than emitted with a broken `file`/`function`.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pkg = dir.path().join("mylib");
+    write(
+        &pkg.join("__init__.py"),
+        r#"__all__ = ["missing"]
+"#,
+    );
+
+    let entries = detect_init_entries(dir.path()).expect("detect");
+    assert!(
+        entries.is_empty(),
+        "an unresolvable __all__ name must be dropped (warn is fine); got {entries:?}",
+    );
+}
+
+#[test]
+fn reexport_resolves_through_subpackage_init() {
+    // `from .sub import foo` where sub/ is a subpackage whose __init__.py
+    // re-exports foo from a deeper module. Resolution must chase one hop
+    // through the subpackage init to land on the real `def foo`.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pkg = dir.path().join("mylib");
+    let sub = pkg.join("sub");
+    write(&sub.join("impl.py"), "def foo():\n    pass\n");
+    write(&sub.join("__init__.py"), "from .impl import foo\n");
+    write(&pkg.join("__init__.py"), "from .sub import foo\n");
+
+    let entries = detect_init_entries(dir.path()).expect("detect");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].name, "foo");
+    assert_eq!(entries[0].function, "foo");
+    assert!(
+        entries[0].file.ends_with("sub/impl.py") || entries[0].file.ends_with("sub\\impl.py"),
+        "re-export through subpackage must land on impl.py, got {}",
+        entries[0].file.display()
+    );
+}
+
+#[test]
+fn reexport_falls_back_to_subpackage_init_when_defined_there() {
+    // `from .sub import foo` where `foo` is defined directly in
+    // `sub/__init__.py`. Resolution should return `sub/__init__.py` — the
+    // walker *will* find `def foo` there.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pkg = dir.path().join("mylib");
+    let sub = pkg.join("sub");
+    write(&sub.join("__init__.py"), "def foo():\n    pass\n");
+    write(&pkg.join("__init__.py"), "from .sub import foo\n");
+
+    let entries = detect_init_entries(dir.path()).expect("detect");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].name, "foo");
+    assert!(
+        entries[0].file.ends_with("sub/__init__.py")
+            || entries[0].file.ends_with("sub\\__init__.py"),
+        "subpackage __init__.py that defines the name directly is a valid target; got {}",
+        entries[0].file.display()
+    );
 }
 
 #[test]

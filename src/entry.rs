@@ -44,6 +44,15 @@ use crate::parse::{parse_file, ParsedFile};
 /// themselves.
 const INIT_ENTRY_CAP: usize = 20;
 
+/// Maximum number of `__init__.py` -> `__init__.py` re-export hops we will
+/// follow when resolving an export to the file that defines it.
+///
+/// A single `.py` module is the common case (depth 0). A subpackage with its
+/// own facade (`pkg/__init__.py` -> `pkg/sub/__init__.py`) is depth 1. Anything
+/// beyond 3 is almost certainly a misconfigured facade chain — we warn and
+/// drop so the snapshot doesn't silently chase the wrong target.
+const MAX_REEXPORT_DEPTH: usize = 3;
+
 /// A single callable entry point: function `function` defined in `file`,
 /// identified by `name` (typically the script name or CLI string).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,6 +121,13 @@ pub fn detect_entries(repo_root: &Path) -> Result<Vec<EntryPoint>> {
 /// 2. Top-level `def`/`class` whose name does not start with `_`.
 /// 3. `from .<submod> import <name> [as <alias>]` — the (aliased) name.
 ///
+/// For each discovered export, the emitted `EntryPoint.file` points at the
+/// file that actually defines the callable (`<pkg>/submod.py` for re-exports,
+/// `<pkg>/__init__.py` when the body defines it). The walker's name-based
+/// entry-point resolver then finds a matching `def`/`class` there — pointing
+/// at the re-export facade would produce an empty snapshot on the common
+/// pure-re-export library shape.
+///
 /// Deduplicated by export name, capped at 20 entries per discovery. When
 /// multiple packages contribute, their exports are unioned and re-capped.
 ///
@@ -126,21 +142,7 @@ pub fn detect_init_entries(repo_root: &Path) -> Result<Vec<EntryPoint>> {
     let mut out = Vec::new();
 
     for init_path in candidate_init_files(repo_root) {
-        let parsed = match parse_file(&init_path) {
-            Ok(p) => p,
-            Err(err) => {
-                tracing::warn!(
-                    "detect_init_entries: could not parse {}: {err:#}",
-                    init_path.display()
-                );
-                continue;
-            }
-        };
-
-        let exports = enumerate_package_exports(&parsed, &init_path);
-        for name in exports {
-            out.push(EntryPoint { name: name.clone(), file: init_path.clone(), function: name });
-        }
+        out.extend(resolve_package_entries(&init_path));
     }
 
     // Union-dedup across packages, preserving first occurrence.
@@ -187,69 +189,287 @@ fn candidate_init_files(repo_root: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// Pull the public-export list out of a single parsed `__init__.py`.
+/// A name re-exported from `__init__.py` via `from .submod import original [as alias]`.
 ///
-/// Priority is strict: if `__all__` is defined, nothing else contributes; only
-/// if it's absent do `def`/`class` and `from .x import y` contribute. This
-/// mirrors Python's own rule for `from pkg import *`.
-fn enumerate_package_exports(parsed: &ParsedFile, init_path: &Path) -> Vec<String> {
+/// `alias` is what callers see (e.g. from `from pkg import X`), `original` is
+/// the name to look up in `submod.py`, and `submod` is the first path segment
+/// after the leading dot.
+#[derive(Debug, Clone)]
+struct RelativeReexport {
+    alias: String,
+    original: String,
+    submod: String,
+}
+
+/// Parse, resolve, and emit `EntryPoint`s for a single `__init__.py`.
+///
+/// Drops exports that can't be resolved to a concrete `def <name>` /
+/// `class <name>` file (with `tracing::warn!`) so the walker's name-based
+/// entry-point resolver doesn't end up searching the facade itself.
+fn resolve_package_entries(init_path: &Path) -> Vec<EntryPoint> {
+    let parsed = match parse_file(init_path) {
+        Ok(p) => p,
+        Err(err) => {
+            tracing::warn!("detect_init_entries: could not parse {}: {err:#}", init_path.display());
+            return Vec::new();
+        }
+    };
+
+    let local_defs = collect_local_defs(&parsed);
+    let reexports = collect_relative_reexports(&parsed);
+    let reexport_by_alias: std::collections::HashMap<&str, &RelativeReexport> =
+        reexports.iter().map(|r| (r.alias.as_str(), r)).collect();
+
+    let export_names = collect_candidate_export_names(&parsed, &reexports);
+
+    let pkg_dir = init_path.parent().unwrap_or_else(|| Path::new("."));
+
+    let mut out = Vec::new();
+    for alias in export_names {
+        // Rule 1: defined directly in __init__.py — keep the facade path.
+        if local_defs.contains(&alias) {
+            out.push(EntryPoint {
+                name: alias.clone(),
+                file: init_path.to_path_buf(),
+                function: alias,
+            });
+            continue;
+        }
+
+        // Rule 2: re-exported via `from .submod import original [as alias]`.
+        if let Some(reexport) = reexport_by_alias.get(alias.as_str()) {
+            match resolve_reexport_file(pkg_dir, &reexport.submod, &reexport.original, 0) {
+                Some(resolved_file) => {
+                    out.push(EntryPoint {
+                        name: reexport.alias.clone(),
+                        file: resolved_file,
+                        function: reexport.original.clone(),
+                    });
+                }
+                None => {
+                    tracing::warn!(
+                        "detect_init_entries: {} re-exports {:?} from .{}, but submodule was not found; dropping entry",
+                        init_path.display(),
+                        reexport.alias,
+                        reexport.submod,
+                    );
+                }
+            }
+            continue;
+        }
+
+        // Rule 3: name in __all__ but neither defined nor imported here.
+        tracing::warn!(
+            "detect_init_entries: {} lists {:?} in __all__ but it is neither defined nor imported in the module; dropping entry",
+            init_path.display(),
+            alias,
+        );
+    }
+
+    if out.len() > INIT_ENTRY_CAP {
+        tracing::warn!(
+            "detect_init_entries: {} exports in {}; capping at {}",
+            out.len(),
+            init_path.display(),
+            INIT_ENTRY_CAP
+        );
+        out.truncate(INIT_ENTRY_CAP);
+    }
+
+    out
+}
+
+/// Collect the ordered, deduped list of candidate export *alias* names from
+/// `__init__.py`.
+///
+/// If `__all__` is set, that's the list verbatim (minus `_`-prefixed).
+/// Otherwise the union of top-level `def`/`class` names and re-export aliases
+/// is returned in source order. The cap is applied by the caller after
+/// resolution so the warning reflects post-resolution counts.
+fn collect_candidate_export_names(
+    parsed: &ParsedFile,
+    reexports: &[RelativeReexport],
+) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    let root = parsed.tree.root_node();
 
-    let all_names = extract_all_list(parsed);
-    if let Some(all_list) = all_names {
+    if let Some(all_list) = extract_all_list(parsed) {
         for name in all_list {
+            if name.starts_with('_') {
+                continue;
+            }
             if seen.insert(name.clone()) {
                 names.push(name);
             }
         }
-    } else {
-        // Module-level def/class — only walk direct children of the module.
-        let mut cursor = root.walk();
-        for child in root.children(&mut cursor) {
-            let Some(export) = top_level_def_or_class_name(&child, &parsed.source) else {
-                continue;
-            };
-            if export.starts_with('_') {
-                continue;
-            }
-            if seen.insert(export.clone()) {
-                names.push(export);
-            }
-        }
-
-        // `from .submod import X [as Y]` — relative imports only.
-        let mut cursor = root.walk();
-        for child in root.children(&mut cursor) {
-            if child.kind() != "import_from_statement" {
-                continue;
-            }
-            if !import_from_is_relative(&child, &parsed.source) {
-                continue;
-            }
-            for imported in import_from_names(&child, &parsed.source) {
-                if imported.starts_with('_') {
-                    continue;
-                }
-                if seen.insert(imported.clone()) {
-                    names.push(imported);
-                }
-            }
-        }
+        return names;
     }
 
-    if names.len() > INIT_ENTRY_CAP {
-        tracing::warn!(
-            "detect_init_entries: {} exports in {}; capping at {}",
-            names.len(),
-            init_path.display(),
-            INIT_ENTRY_CAP
-        );
-        names.truncate(INIT_ENTRY_CAP);
+    // No __all__: merge local defs/classes + re-export aliases in source order.
+    let reexport_aliases: std::collections::HashSet<&str> =
+        reexports.iter().map(|r| r.alias.as_str()).collect();
+
+    let root = parsed.tree.root_node();
+    let mut cursor = root.walk();
+    for child in root.children(&mut cursor) {
+        match child.kind() {
+            "function_definition" | "class_definition" => {
+                let Some(name) = top_level_def_or_class_name(&child, &parsed.source) else {
+                    continue;
+                };
+                if !name.starts_with('_') && seen.insert(name.clone()) {
+                    names.push(name);
+                }
+            }
+            "import_from_statement" => {
+                if !import_from_is_relative(&child, &parsed.source) {
+                    continue;
+                }
+                for alias in import_from_names(&child, &parsed.source) {
+                    if alias.starts_with('_') {
+                        continue;
+                    }
+                    if reexport_aliases.contains(alias.as_str()) && seen.insert(alias.clone()) {
+                        names.push(alias);
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     names
+}
+
+/// Collect names introduced by top-level `def <name>` / `class <name>`.
+fn collect_local_defs(parsed: &ParsedFile) -> std::collections::HashSet<String> {
+    let root = parsed.tree.root_node();
+    let mut out = std::collections::HashSet::new();
+    let mut cursor = root.walk();
+    for child in root.children(&mut cursor) {
+        if let Some(name) = top_level_def_or_class_name(&child, &parsed.source) {
+            out.insert(name);
+        }
+    }
+    out
+}
+
+/// Collect `from .<submod> import <original> [as <alias>]` re-exports.
+///
+/// Only relative imports with a named module (not bare `from . import x`) are
+/// considered — we need the submodule name to resolve the target file. The
+/// `submod` captured here is the first path segment after the leading dots,
+/// so `from .a.b import x` yields `submod = "a"`. Deeper submodule paths are
+/// uncommon in `__init__.py` re-export shims, so we accept the lossy shape
+/// and fall back to the walker's resolver when a deeper lookup would be
+/// needed.
+fn collect_relative_reexports(parsed: &ParsedFile) -> Vec<RelativeReexport> {
+    let root = parsed.tree.root_node();
+    let mut out = Vec::new();
+
+    let mut cursor = root.walk();
+    for child in root.children(&mut cursor) {
+        if child.kind() != "import_from_statement" {
+            continue;
+        }
+        if !import_from_is_relative(&child, &parsed.source) {
+            continue;
+        }
+        let Some(submod) = relative_submod_name(&child, &parsed.source) else {
+            continue;
+        };
+        for (original, alias) in import_from_originals_and_aliases(&child, &parsed.source) {
+            out.push(RelativeReexport { alias, original, submod: submod.clone() });
+        }
+    }
+
+    out
+}
+
+/// Resolve the file where `original` is defined, following at most one hop
+/// through a subpackage `__init__.py` re-export chain.
+///
+/// Returns the file that actually defines `original` via `def`/`class`, or
+/// `None` if no resolution works out before hitting the depth cap. Warns and
+/// drops on excess depth.
+fn resolve_reexport_file(
+    pkg_dir: &Path,
+    submod: &str,
+    original: &str,
+    depth: usize,
+) -> Option<PathBuf> {
+    if depth >= MAX_REEXPORT_DEPTH {
+        tracing::warn!(
+            "detect_init_entries: re-export chain for {:?} under {} exceeded depth {}; dropping",
+            original,
+            pkg_dir.display(),
+            MAX_REEXPORT_DEPTH,
+        );
+        return None;
+    }
+
+    // Prefer the flat `.py` file — the common shape.
+    let flat = pkg_dir.join(format!("{submod}.py"));
+    if flat.is_file() {
+        return Some(flat);
+    }
+
+    // Subpackage: recurse into `<submod>/__init__.py` when it also re-exports
+    // `original`. If that inner init defines `original` directly, return it;
+    // otherwise follow the inner re-export one more hop.
+    let subpkg_init = pkg_dir.join(submod).join("__init__.py");
+    if !subpkg_init.is_file() {
+        return None;
+    }
+
+    let parsed = match parse_file(&subpkg_init) {
+        Ok(p) => p,
+        Err(err) => {
+            tracing::warn!(
+                "detect_init_entries: could not parse {} while resolving re-export: {err:#}",
+                subpkg_init.display()
+            );
+            return None;
+        }
+    };
+
+    if collect_local_defs(&parsed).contains(original) {
+        return Some(subpkg_init);
+    }
+
+    let inner_dir = subpkg_init.parent()?.to_path_buf();
+    for reexport in collect_relative_reexports(&parsed) {
+        if reexport.alias == original {
+            return resolve_reexport_file(
+                &inner_dir,
+                &reexport.submod,
+                &reexport.original,
+                depth + 1,
+            );
+        }
+    }
+
+    None
+}
+
+/// Return the first path segment after the leading dot(s) in
+/// `from .<submod>[.<rest>] import ...`, or `None` for bare `from . import x`.
+fn relative_submod_name(node: &tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+    let module = node.child_by_field_name("module_name")?;
+    if module.kind() != "relative_import" {
+        return None;
+    }
+
+    // A `relative_import` contains one or more `import_prefix` dots followed
+    // optionally by a `dotted_name`.
+    let mut cursor = module.walk();
+    for child in module.children(&mut cursor) {
+        if child.kind() == "dotted_name" {
+            let first = child.child(0)?;
+            return first.utf8_text(source).ok().map(str::to_owned);
+        }
+    }
+    None
 }
 
 /// Parse `__all__ = [...]` into the list of string literals, if present.
@@ -350,25 +570,46 @@ fn import_from_is_relative(node: &tree_sitter::Node<'_>, _source: &[u8]) -> bool
 }
 
 /// Collect the imported (aliased) names from a `from X import a, b as c`.
+///
+/// Returns the visible name — the alias if one exists, otherwise the original
+/// identifier. Used for candidate-export enumeration where we only care about
+/// what external code can reach by name.
 fn import_from_names(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String> {
+    import_from_originals_and_aliases(node, source).into_iter().map(|(_, alias)| alias).collect()
+}
+
+/// Collect `(original, alias)` pairs from a `from X import a, b as c`.
+///
+/// `original` is the name as written in the module being imported from;
+/// `alias` is what the name becomes in the current module (equal to `original`
+/// when there's no `as` clause). The alias is what appears in `__all__`; the
+/// original is what we look up in the target `.py` file.
+fn import_from_originals_and_aliases(
+    node: &tree_sitter::Node<'_>,
+    source: &[u8],
+) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let mut cursor = node.walk();
     for child in node.children_by_field_name("name", &mut cursor) {
         match child.kind() {
             "dotted_name" => {
                 if let Ok(text) = child.utf8_text(source) {
-                    out.push(text.to_owned());
+                    out.push((text.to_owned(), text.to_owned()));
                 }
             }
             "aliased_import" => {
-                if let Some(alias) = child.child_by_field_name("alias") {
-                    if let Ok(text) = alias.utf8_text(source) {
-                        out.push(text.to_owned());
-                    }
-                } else if let Some(name) = child.child_by_field_name("name") {
-                    if let Ok(text) = name.utf8_text(source) {
-                        out.push(text.to_owned());
-                    }
+                let name_text = child
+                    .child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .map(str::to_owned);
+                let alias_text = child
+                    .child_by_field_name("alias")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .map(str::to_owned);
+                match (name_text, alias_text) {
+                    (Some(name), Some(alias)) => out.push((name, alias)),
+                    (Some(name), None) => out.push((name.clone(), name)),
+                    _ => {}
                 }
             }
             _ => {}
