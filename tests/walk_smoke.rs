@@ -85,6 +85,15 @@ async fn walk_main_entry_produces_diamond_and_external() {
         "json.dumps must be External, got {:?}",
         dumps_node.kind
     );
+    // External nodes carry an empty signature: tyreach deliberately skips
+    // the hover LSP call into site-packages to avoid 5 s-per-call tarpits
+    // on heavyweight deps. If this assertion fails, the hover has been
+    // re-enabled — don't "fix" the test, re-read `handle_location`.
+    assert_eq!(
+        dumps_node.signature, "",
+        "External node `{}` must have empty signature; got {:?}",
+        dumps_node.qname, dumps_node.signature
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

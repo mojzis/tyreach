@@ -228,19 +228,13 @@ impl<'a> Walker<'a> {
         // N>1 → union; single resolved/external → resolved/external.
         let union = locations.len() > 1;
         for loc in locations {
-            self.handle_location(item, cs, &loc, union).await;
+            self.handle_location(item, cs, &loc, union);
         }
 
         Ok(())
     }
 
-    async fn handle_location(
-        &mut self,
-        item: &WalkItem,
-        cs: &CallSite,
-        loc: &Location,
-        union: bool,
-    ) {
+    fn handle_location(&mut self, item: &WalkItem, cs: &CallSite, loc: &Location, union: bool) {
         let Some(target_path) = uri_to_path(&loc.uri) else {
             tracing::warn!("cannot parse target uri {}", loc.uri);
             self.emit_unresolved(item, cs);
@@ -254,17 +248,15 @@ impl<'a> Walker<'a> {
                 self.handle_internal_target(item, cs, &target_path, loc, union);
             }
             Kind::External => {
+                // Deliberately skip hover on External targets. That hover is
+                // the only LSP call that reaches *into* site-packages and on
+                // heavyweight deps (ty's own internals, FastAPI, etc.) it
+                // tarpits with 5 s timeouts per call, blowing the walk
+                // budget. External nodes carry an empty signature.
                 let qname = qname_for(&target_path, &self.repo_root, &cs.callee_text);
-                let signature = fetch_hover_first_line(
-                    self.client,
-                    &target_path.to_string_lossy(),
-                    loc.range.start.line,
-                    loc.range.start.character,
-                )
-                .await;
                 self.ensure_node(Node {
                     qname: qname.clone(),
-                    signature,
+                    signature: String::new(),
                     doc: String::new(),
                     file: String::new(),
                     line: 0,
