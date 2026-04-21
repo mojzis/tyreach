@@ -1,0 +1,6 @@
+[project]
+name = "same_module"
+version = "0.1.0"
+
+[tool.ty.src]
+include = ["**"]

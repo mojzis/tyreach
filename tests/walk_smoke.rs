@@ -13,6 +13,14 @@ fn medium_app_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/medium_app")
 }
 
+fn same_module_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/same_module")
+}
+
+fn class_target_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/class_target")
+}
+
 fn ty_available() -> bool {
     std::env::var("TY_AVAILABLE").is_ok()
 }
@@ -156,5 +164,97 @@ async fn walk_dyn_getattr_is_unresolved() {
         has_unresolved_edge,
         "expected at least one unresolved edge; got {:#?}",
         snapshot.edges
+    );
+}
+
+/// Phase 2 regression — a same-module call (`main → helper` in one file)
+/// must resolve to an Internal function node via position-based target
+/// resolution. Before Phase 2 the walker's name-based lookup still worked
+/// in this trivial case, but we pin it now so any future regression in
+/// `locate_target_at` is caught.
+#[tokio::test(flavor = "multi_thread")]
+async fn walk_same_module_call_resolves_to_internal_function() {
+    if !ty_available() {
+        eprintln!("skipping: set TY_AVAILABLE=1 to run");
+        return;
+    }
+
+    let root = same_module_root();
+    let entry = EntryPoint {
+        name: "main".to_owned(),
+        file: root.join("same_module/app.py"),
+        function: "main".to_owned(),
+    };
+
+    let deadline = Duration::from_secs(15);
+    let snapshot = tokio::time::timeout(deadline, tyreach::snapshot(&root, vec![entry]))
+        .await
+        .expect("same-module snapshot must finish within 15s")
+        .expect("same-module snapshot ok");
+
+    // main → helper edge exists and is Resolved.
+    let main_to_helper = snapshot
+        .edges
+        .iter()
+        .find(|e| e.from == "same_module.app.main" && e.to == "same_module.app.helper")
+        .unwrap_or_else(|| panic!("expected main → helper edge; got {:#?}", snapshot.edges));
+    assert_eq!(main_to_helper.annotation, Annotation::Resolved);
+
+    // helper node is Internal (walked into, not synthesized as external).
+    let helper =
+        snapshot.nodes.iter().find(|n| n.qname == "same_module.app.helper").unwrap_or_else(|| {
+            panic!(
+                "expected helper node; got {:#?}",
+                snapshot.nodes.iter().map(|n| &n.qname).collect::<Vec<_>>()
+            )
+        });
+    assert_eq!(helper.kind, Kind::Internal);
+}
+
+/// Phase 2 — class-valued call target. `def main(): MyCls()` must produce
+/// an Internal leaf node for `MyCls` with a `class MyCls` signature, and
+/// the walker must not queue `MyCls` (it's a leaf — no queue push). Before
+/// Phase 2 the walker emitted a dangling edge and logged a WARN because it
+/// searched for a `function_definition` named `MyCls` and found none.
+#[tokio::test(flavor = "multi_thread")]
+async fn walk_class_target_becomes_internal_leaf() {
+    if !ty_available() {
+        eprintln!("skipping: set TY_AVAILABLE=1 to run");
+        return;
+    }
+
+    let root = class_target_root();
+    let entry = EntryPoint {
+        name: "main".to_owned(),
+        file: root.join("class_target/app.py"),
+        function: "main".to_owned(),
+    };
+
+    let deadline = Duration::from_secs(15);
+    let snapshot = tokio::time::timeout(deadline, tyreach::snapshot(&root, vec![entry]))
+        .await
+        .expect("class-target snapshot must finish within 15s")
+        .expect("class-target snapshot ok");
+
+    // Edge main → MyCls exists.
+    let has_edge = snapshot
+        .edges
+        .iter()
+        .any(|e| e.from == "class_target.app.main" && e.to == "class_target.app.MyCls");
+    assert!(has_edge, "expected main → MyCls edge; got {:#?}", snapshot.edges);
+
+    // Node for MyCls exists with Kind::Internal and a `class MyCls` signature.
+    let my_cls =
+        snapshot.nodes.iter().find(|n| n.qname == "class_target.app.MyCls").unwrap_or_else(|| {
+            panic!(
+                "expected MyCls node; got {:#?}",
+                snapshot.nodes.iter().map(|n| &n.qname).collect::<Vec<_>>()
+            )
+        });
+    assert_eq!(my_cls.kind, Kind::Internal);
+    assert!(
+        my_cls.signature.starts_with("class MyCls"),
+        "expected signature to start with `class MyCls`, got {:?}",
+        my_cls.signature
     );
 }

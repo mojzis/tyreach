@@ -57,6 +57,21 @@ struct WalkItem {
     depth: u32,
 }
 
+/// Position-based resolution of a `goto_definition` target. Either the target
+/// points at a `function_definition` (we walk into it) or at a
+/// `class_definition` (we emit a leaf node and stop).
+enum TargetResolved {
+    Function {
+        range: Range<usize>,
+    },
+    Class {
+        signature: String,
+        /// 0-based start row of the `class` keyword; the caller promotes this
+        /// to a 1-based line when building the `Node`.
+        start_row: u32,
+    },
+}
+
 /// Walker state. One walker handles one or more entry points, sharing the
 /// LSP client, classifier, visited set, and parsed-file cache.
 pub struct Walker<'a> {
@@ -288,46 +303,81 @@ impl<'a> Walker<'a> {
         // Resolve to a canonical target path for downstream parsing / qname.
         let canonical = target_path.canonicalize().unwrap_or_else(|_| target_path.to_path_buf());
         let target_qname = qname_for(&canonical, &self.repo_root, &cs.callee_text);
-
         let annotation = if union { Annotation::Union } else { Annotation::Resolved };
-        self.snapshot.edges.push(Edge {
-            from: item.qname.clone(),
-            to: target_qname.clone(),
-            annotation,
-        });
 
-        if self.visited.contains(&target_qname) {
-            return;
-        }
-        if self.queue.iter().any(|q| q.qname == target_qname) {
-            return;
-        }
+        // Position-based resolution: look at the exact point ty pointed us at
+        // and walk upward to the nearest enclosing function/class definition.
+        // This is robust to aliasing, class targets, and import lines where
+        // the call-site identifier doesn't match any definition name on the
+        // target line.
+        let resolved = match self.locate_target_at(
+            &canonical,
+            loc.range.start.line,
+            loc.range.start.character,
+        ) {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                tracing::warn!(
+                    "internal target {} ({}:{}:{}) — no function_definition or class_definition found",
+                    target_qname,
+                    canonical.display(),
+                    loc.range.start.line,
+                    loc.range.start.character
+                );
+                return;
+            }
+            Err(err) => {
+                tracing::warn!("internal target {} parse failed: {err:?}", target_qname);
+                return;
+            }
+        };
 
-        // Need the exact function_definition byte range for the BFS queue.
-        let target_range =
-            match self.locate_function_at(&canonical, &cs.callee_text, loc.range.start.line) {
-                Ok(Some(range)) => range,
-                Ok(None) => {
-                    tracing::warn!(
-                        "internal target {} ({}:{}) — no function_definition found",
-                        target_qname,
-                        canonical.display(),
-                        loc.range.start.line
-                    );
+        match resolved {
+            TargetResolved::Function { range } => {
+                self.snapshot.edges.push(Edge {
+                    from: item.qname.clone(),
+                    to: target_qname.clone(),
+                    annotation,
+                });
+
+                if self.visited.contains(&target_qname) {
                     return;
                 }
-                Err(err) => {
-                    tracing::warn!("internal target {} parse failed: {err:?}", target_qname);
+                if self.queue.iter().any(|q| q.qname == target_qname) {
                     return;
                 }
-            };
 
-        self.queue.push_back(WalkItem {
-            qname: target_qname,
-            file: canonical,
-            byte_range: target_range,
-            depth: item.depth.saturating_add(1),
-        });
+                self.queue.push_back(WalkItem {
+                    qname: target_qname,
+                    file: canonical,
+                    byte_range: range,
+                    depth: item.depth.saturating_add(1),
+                });
+            }
+            TargetResolved::Class { signature, start_row } => {
+                self.snapshot.edges.push(Edge {
+                    from: item.qname.clone(),
+                    to: target_qname.clone(),
+                    annotation,
+                });
+
+                // Mark as visited so we never queue or re-emit this class.
+                // The class is a *leaf*: we do NOT push it onto the BFS queue.
+                if !self.visited.insert(target_qname.clone()) {
+                    return;
+                }
+
+                let rel_file = relative_to_root(&canonical, &self.repo_root);
+                self.ensure_node(Node {
+                    qname: target_qname,
+                    signature,
+                    doc: String::new(),
+                    file: rel_file,
+                    line: start_row.saturating_add(1),
+                    kind: Kind::Internal,
+                });
+            }
+        }
     }
 
     fn emit_unresolved(&mut self, item: &WalkItem, cs: &CallSite) {
@@ -366,14 +416,47 @@ impl<'a> Walker<'a> {
         Ok(find_function_definition(parsed, function, None).map(|n| n.byte_range()))
     }
 
-    fn locate_function_at(
+    /// Resolve a `goto_definition` target by *position* rather than by name.
+    ///
+    /// Starts from the tree-sitter node that covers `(line, character)` and
+    /// walks parents until it hits a `function_definition` or
+    /// `class_definition`. This is robust to:
+    ///
+    /// - aliasing (`from m import x as y` — name-based lookup for `y` in `m`
+    ///   misses the definition),
+    /// - class-valued targets (ty points at a `class_definition`; the old
+    ///   name-based code searched for a `function_definition` and warned),
+    /// - import lines (ty points at the `import` statement when the symbol is
+    ///   re-exported; we walk up and find nothing, which is a genuine miss).
+    fn locate_target_at(
         &mut self,
         file: &Path,
-        function: &str,
-        line_hint: u32,
-    ) -> Result<Option<Range<usize>>> {
+        line: u32,
+        character: u32,
+    ) -> Result<Option<TargetResolved>> {
         let parsed = self.get_parsed(file)?;
-        Ok(find_function_definition(parsed, function, Some(line_hint)).map(|n| n.byte_range()))
+        let root = parsed.tree.root_node();
+        let point = tree_sitter::Point { row: line as usize, column: character as usize };
+        let Some(mut node) = root.descendant_for_point_range(point, point) else {
+            return Ok(None);
+        };
+        loop {
+            match node.kind() {
+                "function_definition" => {
+                    return Ok(Some(TargetResolved::Function { range: node.byte_range() }));
+                }
+                "class_definition" => {
+                    let signature = first_line_of_class_header(&node, &parsed.source);
+                    let start_row = u32::try_from(node.start_position().row).unwrap_or(0);
+                    return Ok(Some(TargetResolved::Class { signature, start_row }));
+                }
+                _ => {}
+            }
+            match node.parent() {
+                Some(p) => node = p,
+                None => return Ok(None),
+            }
+        }
     }
 }
 
@@ -444,6 +527,30 @@ fn first_docstring_line(fn_node: &tree_sitter::Node<'_>, source: &[u8]) -> Strin
         }
     }
     String::new()
+}
+
+/// Extract the class header signature — `class Name(Base, ...)` — without the
+/// trailing `:` or body. Used as the `signature` field for class-leaf nodes.
+///
+/// Strategy: slice the source from the class node's start byte up to the
+/// start of its `body` field, then trim trailing whitespace and a single
+/// colon. Falls back to the first line of the node text when the body field
+/// is missing (shouldn't happen for valid Python).
+fn first_line_of_class_header(class_node: &tree_sitter::Node<'_>, source: &[u8]) -> String {
+    let start = class_node.start_byte();
+    let header_end = class_node.child_by_field_name("body").map_or_else(
+        || {
+            let text = class_node.utf8_text(source).unwrap_or("");
+            start + text.lines().next().map_or(0, str::len)
+        },
+        |b| b.start_byte(),
+    );
+    let slice = source.get(start..header_end).unwrap_or(&[]);
+    let text = std::str::from_utf8(slice).unwrap_or("").trim_end();
+    // Collapse any internal newlines/whitespace into single spaces so a
+    // multi-line base list renders on one line.
+    let single_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    single_line.strip_suffix(':').unwrap_or(&single_line).trim_end().to_owned()
 }
 
 fn extract_docstring_first_line(raw: &str) -> String {
