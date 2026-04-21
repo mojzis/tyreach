@@ -69,6 +69,21 @@ demo = "app.cli:main"
         stdout.contains("app/cli.py") || stdout.contains("app\\cli.py"),
         "expected resolved `app/cli.py` path in stdout:\n{stdout}"
     );
+    // CLAUDE.md snippet must appear and name the filename `snapshot` will
+    // actually write (first entry's name) — if this drifts from
+    // `derive_prefix_from_name`, agents will be told the wrong file.
+    assert!(
+        stdout.contains("## Call-graph context (tyreach)"),
+        "expected CLAUDE.md section header in stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("read `demo.txt`"),
+        "expected CLAUDE.md snippet to name `demo.txt`, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("`demo.toon`"),
+        "expected CLAUDE.md snippet to name `demo.toon`, got:\n{stdout}"
+    );
 }
 
 #[test]
@@ -161,6 +176,17 @@ fn setup_prints_skeleton_when_empty() {
     );
     assert!(stdout.contains("entry_file"), "expected entry_file field in skeleton:\n{stdout}");
     assert!(stdout.contains("--entry"), "expected example `--entry` invocation, got:\n{stdout}");
+    // Empty case points the user at re-running setup for the CLAUDE.md
+    // snippet once they've configured entries — don't print a snippet
+    // with a guessed filename.
+    assert!(
+        !stdout.contains("## Call-graph context (tyreach)"),
+        "empty case must not print a CLAUDE.md snippet (no filename to substitute):\n{stdout}"
+    );
+    assert!(
+        stdout.contains("CLAUDE.md snippet"),
+        "empty case should still mention CLAUDE.md as a forward pointer:\n{stdout}"
+    );
 }
 
 #[test]

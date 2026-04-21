@@ -126,6 +126,31 @@ tyreach snapshot [REPO]
 tyreach render [INPUT]              (re-render a TOON snapshot; stdin if omitted)
 ```
 
+## Using with Claude Code (or other coding agents)
+
+A snapshot only helps if agents actually read it. Add a short section to
+your repo's `CLAUDE.md` (or `AGENTS.md`) pointing at the generated files so
+the agent knows to consult them before editing Python code:
+
+```markdown
+## Call-graph context (tyreach)
+
+Before changing Python code, read `myapp.txt` — a ranked reachability
+snapshot of the call graph from this repo's entry points, with function
+signatures and call edges. The canonical machine-readable form is
+`myapp.toon`.
+
+Regenerate after non-trivial changes: `tyreach snapshot`.
+```
+
+Replace `myapp` with your first entry's name (the key from
+`[project.scripts]`, the first `name` in `tyreach.toml`, or the `--out`
+prefix you used). `tyreach setup` prints a copy-pasteable version with the
+correct filename already substituted for your repo.
+
+Commit the generated `.toon` / `.txt` alongside the code they describe so
+fresh clones and CI agents pick up the context without a rebuild step.
+
 ## Output format
 
 The canonical output is TOON (tabular schema + CSV-like rows); see

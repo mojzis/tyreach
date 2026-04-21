@@ -45,8 +45,9 @@ Minimal tyreach.toml:
   entry_file = \"myapp/cli.py\"
   function = \"main\"   # optional; defaults to \"main\"
 
-Run `tyreach setup` inside a repo to diagnose which source wins and see \
-the resolved file paths.";
+Run `tyreach setup` inside a repo to diagnose which source wins, see the \
+resolved file paths, and get a ready-to-paste CLAUDE.md snippet that tells \
+coding agents to read the snapshot before editing Python code.";
 
 const ABOUT: &str = "\
 Ranked, token-budgeted reachability snapshot of a Python project. \
@@ -313,9 +314,35 @@ fn run_setup(repo: &Path) -> Result<()> {
         }
         println!();
         println!("next: run `tyreach snapshot` from {}", root.display());
+        println!();
+        print_claude_md_snippet(active);
     }
 
     Ok(())
+}
+
+/// The prefix `snapshot` will derive — matches `derive_prefix_from_name`
+/// exactly so the snippet names the files `snapshot` actually writes.
+fn snapshot_prefix_for(active: &[EntryPoint]) -> &str {
+    active.first().map_or("tyreach-snapshot", |e| e.name.as_str())
+}
+
+fn print_claude_md_snippet(active: &[EntryPoint]) {
+    let prefix = snapshot_prefix_for(active);
+    println!(
+        "To wire this into a coding agent, add a section to your CLAUDE.md \
+         (or AGENTS.md) so the agent reads the snapshot before editing \
+         Python code:"
+    );
+    println!();
+    println!("  ## Call-graph context (tyreach)");
+    println!();
+    println!("  Before changing Python code, read `{prefix}.txt` — a ranked");
+    println!("  reachability snapshot of the call graph from this repo's");
+    println!("  entry points, with function signatures and call edges. The");
+    println!("  canonical machine-readable form is `{prefix}.toon`.");
+    println!();
+    println!("  Regenerate after non-trivial changes: `tyreach snapshot`.");
 }
 
 fn pluralize_entries(count: usize) -> &'static str {
@@ -344,6 +371,12 @@ fn print_empty_skeleton() {
     println!();
     println!("     [project.scripts]");
     println!("     mytool = \"mypkg.cli:main\"");
+    println!();
+    println!(
+        "Once entries are configured, run `tyreach setup` again — it will \
+         print a ready-to-paste CLAUDE.md snippet tailored to your entry \
+         filename."
+    );
 }
 
 fn run_render(input: Option<&Path>) -> Result<()> {
