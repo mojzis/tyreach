@@ -167,7 +167,26 @@ async fn run_snapshot(
         write_rendered_file(&snapshot, &prefix)?;
     }
 
+    // Structurally-valid but empty snapshots are a silent foot-gun: an agent
+    // reads the empty `.txt` and concludes "no reachable code" when the
+    // actual cause is usually that the entry points at a non-function object
+    // (`app = typer.Typer()`). Loud-fail to stderr, but keep exit 0 so
+    // scripted callers that key on exit code don't break.
+    if snapshot.nodes.is_empty() && snapshot.edges.is_empty() {
+        print_empty_snapshot_warning();
+    }
+
     Ok(())
+}
+
+fn print_empty_snapshot_warning() {
+    eprintln!("tyreach: wrote an EMPTY snapshot (0 nodes, 0 edges).");
+    eprintln!("  likely causes:");
+    eprintln!("    - the entry points at a non-function object (e.g. `app = typer.Typer()`)");
+    eprintln!("    - the entry file exists but the named function was not found");
+    eprintln!("    - the entry function has no body, or only calls dynamic/unresolvable code");
+    eprintln!("  check the entries with `tyreach setup` and try `--entry <file>::<func>`");
+    eprintln!("  pointing at a real `def`.");
 }
 
 fn derive_prefix_from_name(name: String) -> PathBuf {
