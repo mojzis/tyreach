@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 
-use tyreach::budget::fit_to_budget;
+use tyreach::budget::{fit_to_budget, scale_budget};
 use tyreach::model::{Annotation, Edge, Kind, Node};
 use tyreach::rank;
 use tyreach::walker::Snapshot;
@@ -73,6 +73,30 @@ fn ultra_tight_budget_keeps_only_entry_points() {
     let trunc = out.truncation.expect("truncation metadata required");
     assert_eq!(trunc.original_node_count as usize, original_len);
     assert_eq!(trunc.dropped_nodes as usize, original_len - 1);
+}
+
+#[test]
+fn scale_budget_single_entry_default_cli_unchanged() {
+    // 1 entry × 500 = 500 floor; CLI default 2000 wins.
+    assert_eq!(scale_budget(2000, 1), 2000);
+}
+
+#[test]
+fn scale_budget_six_entries_default_cli_scales_to_floor() {
+    // 6 entries × 500 = 3000 floor, which beats the 2000 CLI default.
+    assert_eq!(scale_budget(2000, 6), 3000);
+}
+
+#[test]
+fn scale_budget_ten_entries_default_cli_scales_to_floor() {
+    // 10 entries × 500 = 5000 floor, which beats the 2000 CLI default.
+    assert_eq!(scale_budget(2000, 10), 5000);
+}
+
+#[test]
+fn scale_budget_explicit_cli_beats_floor() {
+    // Explicit --budget 10000 beats the 6-entry floor of 3000.
+    assert_eq!(scale_budget(10000, 6), 10000);
 }
 
 #[test]

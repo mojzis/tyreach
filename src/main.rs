@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use tyreach::budget::fit_to_budget;
+use tyreach::budget::{fit_to_budget, scale_budget, PER_ENTRY_BUDGET_FLOOR};
 use tyreach::entry::{detect_entries, parse_tyreach_toml, resolve_entries, EntryPoint};
 use tyreach::rank::rank;
 use tyreach::render::render;
@@ -145,10 +145,20 @@ async fn run_snapshot(
 
     let entries = resolve_entries(&root, cli_entries)?;
     let entry_name_for_prefix = entries.first().map(|e| e.name.clone());
+    let entry_count = entries.len();
+    let effective_budget = scale_budget(budget_tokens, entry_count);
+    let floor = PER_ENTRY_BUDGET_FLOOR.saturating_mul(entry_count);
+    tracing::info!(
+        "budget: {} tokens (cli={}, entries={}, floor={})",
+        effective_budget,
+        budget_tokens,
+        entry_count,
+        floor
+    );
 
     let mut snapshot = tyreach::snapshot(&root, entries).await?;
     rank(&mut snapshot);
-    let snapshot = fit_to_budget(snapshot, budget_tokens);
+    let snapshot = fit_to_budget(snapshot, effective_budget);
 
     if to_stdout {
         let stdout = io::stdout();

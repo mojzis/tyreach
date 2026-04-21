@@ -12,6 +12,24 @@
 
 use crate::walker::{Snapshot, Truncation};
 
+/// Per-entry token floor used by `scale_budget`.
+///
+/// Multi-entry snapshots need more budget than the clap default (2000)
+/// accommodates — a 6-entry repo needs ~3000 tokens just to keep the
+/// intra-repo edges of its entries.
+pub const PER_ENTRY_BUDGET_FLOOR: usize = 500;
+
+/// Scale the effective budget with entry count.
+///
+/// The CLI value wins unless `PER_ENTRY_BUDGET_FLOOR * entry_count` is larger,
+/// in which case that floor is used. This lets the clap default (2000) stay
+/// clean while preventing starvation on repos with many entries.
+#[must_use]
+pub fn scale_budget(cli: usize, entry_count: usize) -> usize {
+    let floor = PER_ENTRY_BUDGET_FLOOR.saturating_mul(entry_count);
+    cli.max(floor)
+}
+
 /// Rough chars-per-token divisor (matches GPT-style estimators).
 const CHARS_PER_TOKEN: usize = 4;
 
