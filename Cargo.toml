@@ -20,7 +20,7 @@ tree-sitter = "0.26"
 tree-sitter-python = "0.25"
 rayon = "1.10"
 ignore = "0.4"
-toml = "0.8"
+toml = "1.1"
 tokio = { version = "1", features = ["full"] }
 toon-format = { version = "0.5.0", default-features = false }
 
