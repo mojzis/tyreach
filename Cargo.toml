@@ -1,6 +1,6 @@
 [package]
 name = "tyreach"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Ranked, token-budgeted reachability snapshot of Python symbols via tree-sitter + ty LSP"
 license = "MIT"
